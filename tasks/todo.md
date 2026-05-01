@@ -314,6 +314,13 @@ mtp_logits = ggml_mul_mat(model.output, x);  // SHARED lm_head
 ### 6.4 Quantization
 - [ ] **Pin F32**: all `*_norm.weight` tensors (`attn_norm`, `ffn_norm`, `attn_q_norm`, `attn_k_norm`, `attn_g_norm`, `attn_q_a_norm`, `attn_kv_a_norm`, `enorm`, `hnorm`, `final_layernorm`, `output_norm`), `attn_g_decay`, `ffn_gate_inp` (router), `ffn_exp_probs_b` (expert bias).
 - [ ] Quantize normally (Q4_K_M as default test target): all `*_proj`, `query_key_value`, `dense`, `g_proj`, `q_a/q_b`, `kv_a/kv_b`, `k_b`/`v_b`, MoE expert tensors, `tok_embd`, `output`, `eh_proj`.
+- [x] Disk/VRAM-constrained smoke quant: generated Q2_K from the validated Q8_0 GGUF with `--allow-requantize --leave-output-tensor`. Output: `/home/bigkahuna/models/gguf/Ling-2.6-flash-fp8-Q2_K.gguf` (~37 GiB). Dry-run estimate was 37,753 MiB (~36.9 GiB). IQ2_XXS/IQ2_XS are smaller but require an imatrix for actual quantization in this build; Q3_K_S/Q3+ were too close to free disk.
+- [x] Validate Q2_K GGUF with `tasks/validate_ling26_gguf.py`: passed structural checks (573 tensors, expected recurrent/MLA pattern, group_norm_groups=4, expert groups=8/4).
+- [x] Build a full CUDA-enabled binary in the existing `build/` dir (`GGML_CUDA=ON`, `GGML_CUDA_FA=ON`, full arch list `75-virtual;80-virtual;86-real;89-real;120a-real;121a-real`). `ccache` installed/capped at 2 GiB before build.
+- [x] CPU smoke on Q2_K: `./build/bin/llama-simple -m ...Q2_K.gguf -n 1 -ngl 0 hello` passed; eval ~90 ms/token on CPU for the 1-token smoke.
+- [x] CPU quality smoke on Q2_K with GPUs hidden: `CUDA_VISIBLE_DEVICES= ./build/bin/llama-simple -m ...Q2_K.gguf -n 32 -ngl 0 "Write one short sentence about llamas."` completed but still produced degenerate output (`0x1000000...`). This confirms the degenerate generation is not specific to Q8_0; it is a graph/parity issue or checkpoint/export issue that survives Q2_K.
+- [x] CUDA partial-offload smoke on Q2_K: `CUDA_VISIBLE_DEVICES=0,1 ./build/bin/llama-simple -m ...Q2_K.gguf -n 1 -ngl 8 hello` passed. Current box had other Python GPU workloads using ~16 GiB per 5090, so full offload failed with CUDA0 OOM; partial offload placed 8/34 layers on 2x5090 and decoded successfully. Log: `tasks/logs/ling26_q2k_cuda_2x5090_ngl8_decode_n1.log`.
+- [ ] Re-run full-offload Q2_K VRAM smoke when the two RTX 5090s are free. Expected model payload is ~37 GiB plus buffers, so it should fit across 2x32 GiB but not one 32 GiB GPU.
 - [ ] Run perplexity on wiki.test.raw at Q4_K_M; flag if >5% degradation vs F16.
 
 ### 6.5 Documentation
