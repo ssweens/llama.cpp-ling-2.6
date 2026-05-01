@@ -11285,11 +11285,16 @@ class BailingMoeV2_5Model(BailingMoeV2Model):
         # Per-layer attention-type encoding (matches kimi-linear convention):
         #   0 = recurrent (linear-attn / Lightning-Attention-2)
         #   1 = MLA (compressed to MQA via kv_b_proj split, see modify_tensors)
+        # Layer pattern: every G-th layer is MLA, others are linear-attn.
+        # SGLang's deployment-canonical impl asserts L % G == 0 and uses the
+        # simple `(il+1) % G != 0` predicate (no tail clause). We do the same.
+        assert L % G == 0, f"num_hidden_layers={L} must be divisible by layer_group_size={G}"
         head_kv_list: list[int] = []
         for il in range(L):
-            is_mla = ((il + 1) % G == 0) or (il >= (L // G) * G)
+            is_mla = (il + 1) % G == 0
             head_kv_list.append(1 if is_mla else 0)
-        # MTP layers always use MLA (HF hardcodes it in BailingMoeV2_5MTPLayer)
+        # MTP layers always use MLA (HF hardcodes it in BailingMoeV2_5MTPLayer;
+        # SGLang sets attention_type=1 for the MTP decoder layer)
         head_kv_list.extend([1] * nextn)
         self.gguf_writer.add_head_count_kv(head_kv_list)
 
@@ -11299,11 +11304,13 @@ class BailingMoeV2_5Model(BailingMoeV2Model):
         self.gguf_writer.add_key_length_mla(hparams["qk_nope_head_dim"] + hparams["qk_rope_head_dim"])
         self.gguf_writer.add_value_length_mla(hparams["v_head_dim"])
 
-        # Linear-attn output GroupRMSNorm: 'group_norm_size' channels per group
-        # → n_groups = (n_head * head_dim) / group_norm_size. For Ling-2.6-flash:
-        # 4096 / 4 = 1024 groups.
-        gns = hparams["group_norm_size"]
-        self.gguf_writer.add_group_norm_groups((n_head * head_dim) // gns)
+        # Linear-attn output GroupRMSNorm.
+        # HF semantics: group_norm_size is the NUMBER OF GROUPS; each group has
+        # (hidden / group_norm_size) channels normalized together.
+        # For Ling-2.6-flash: group_norm_size=4 -> 4 groups of 1024 channels.
+        # Verified against SGLang fla.RMSNormGated which calls with
+        # group_size = hidden_inner / group_norm_size (channels per group).
+        self.gguf_writer.add_group_norm_groups(hparams["group_norm_size"])
 
     @staticmethod
     def _build_slopes(n_attention_heads: int) -> Tensor:
@@ -11349,8 +11356,7 @@ class BailingMoeV2_5Model(BailingMoeV2Model):
         n_head = self.hparams["num_attention_heads"]
         base = self._build_slopes(n_head)
         for il in range(L):
-            is_mla = ((il + 1) % G == 0) or (il >= (L // G) * G)
-            if is_mla:
+            if (il + 1) % G == 0:  # MLA layer, no slope needed
                 continue
             scale = 1.0 - (il - 1) / (L - 1) + 1e-5
             g = -base * scale

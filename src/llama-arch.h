@@ -106,6 +106,7 @@ enum llm_arch {
     LLM_ARCH_PLM,
     LLM_ARCH_BAILINGMOE,
     LLM_ARCH_BAILINGMOE2,
+    LLM_ARCH_BAILINGMOE2_5,
     LLM_ARCH_DOTS1,
     LLM_ARCH_ARCEE,
     LLM_ARCH_AFMOE,
@@ -487,6 +488,9 @@ enum llm_tensor {
     LLM_TENSOR_ATTN_V_B,
     LLM_TENSOR_ATTN_Q_A_NORM,
     LLM_TENSOR_ATTN_KV_A_NORM,
+    LLM_TENSOR_ATTN_G_PROJ,        // bailingmoe2.5 linear-attn output sigmoid gate projection
+    LLM_TENSOR_ATTN_G_NORM,        // bailingmoe2.5 linear-attn GroupRMSNorm
+    LLM_TENSOR_ATTN_G_DECAY,       // bailingmoe2.5 linear-attn precomputed per-head log-decay
     LLM_TENSOR_ATTN_SUB_NORM,
     LLM_TENSOR_FFN_SUB_NORM,
     LLM_TENSOR_DEC_ATTN_NORM,

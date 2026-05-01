@@ -18,6 +18,10 @@ These were wrong or imprecise in earlier drafts and have been fixed in `todo.md`
 | 6 | Encode hybrid pattern via dedicated `recurrent_layer_arr` field | Existing convention is **per-layer `head_count_kv` list with 0 = recurrent** | §2.2, §3.2 |
 | 7 | `g_proj` consumes the post-attention output | `g_proj` consumes the `input_layernorm` output of the layer (parallel input gate, not output gate of the attention) | §5.3, §5.4 |
 | 8 | Effort estimate ~2–4 weeks | Revised to ~1.5–3 weeks once V2 reuse is properly accounted for; the new ggml op is the dominant cost | §4 (entire phase) |
+| **9** | **GroupRMSNorm: `group_norm_size=4` means 1024 groups of 4 channels each** | **REVERSED. It means 4 groups of 1024 channels each. The HF reshape uses `(group_norm_size, hidden/group_norm_size) = (4, 1024)` with normalization over the inner-1024 axis. Confirmed by SGLang's fla `RMSNormGated(group_size = hidden/group_norm_size = 1024)` where `group_size` is channels-per-group.** | §2.2, §5.4 |
+| **10** | **Layer pattern formula needs `or il >= L//G * G` tail clause** | **SGLang deployment-canonical impl uses ONLY `(il+1) % G != 0` and asserts `L % G == 0`. For Ling-2.6-flash (L=32, G=8) both forms agree. Drop the tail clause; assert clean multiples instead.** | §2.2, §2.4 |
+| **11** | **Layer-attn `q` is unscaled** | **For seg_la backend, the kernel applies `softmax_scale = head_dim^(-0.5)` internally to q. For our ggml impl we will pre-scale q in the graph builder before the scan op.** | §5.4 |
+| **12** | **Linear-attn computation in fp16/bf16** | **SGLang casts QKV to F32 (`qkv = qkv.to(torch.float32)`) before the linear-attn computation. Match this in graph for numerical parity.** | §5.4 |
 
 ---
 
@@ -46,6 +50,21 @@ V2.5's `chat_template.jinja` adds tool-calling and multi-step tool-response dete
 
 ### 2.4 GPU backends deferred
 First PR ships CPU-only `ggml_simple_gla_scan`. Rationale: CUDA/Metal kernels for new scan ops typically take 2-3× as long as the CPU reference and add review surface. Track follow-up in a separate issue.
+
+### 2.5 Slope sign convention: HF / fla style (already-negated)
+Two possible storage conventions for the per-layer per-head decay tensor:
+- **HF / fla** (what we use): bake `g = -base_slopes * scale` (negative) at convert time. The scan op directly applies `S = exp(g) * S + ...`.
+- **SGLang seg_la**: stores positive `slope` in a buffer; kernel does `decay_scale = -tl.load(slope) ; ratio = exp(decay_scale)`. Same math, different storage sign.
+
+We match HF/fla because (a) the HF modeling code is the closest to training-time numerics, (b) one less negation in the kernel. **Document this in the `ggml_simple_gla_scan` op header.**
+
+### 2.6 Slope formula: HF off-by-one preserved
+**Conflict**: HF reference (`modeling_bailing_moe_v2_5.py`) uses `1 - (layer_idx - 1)/(num_layers - 1) + 1e-5`. SGLang's `LightningAttentionBackend._build_slope_tensor` (a generic Lightning Attention impl) uses `1 - layer_id/(num_hidden_layers - 1) + 1e-5` (no `-1` offset). They differ by one layer of phase.
+
+For V1 we use **HF's formula** (the off-by-one variant). Rationale:
+- HF code is shipped alongside the checkpoint and is closest to training-time semantics.
+- SGLang's `lightning_backend.py` is generic and may not be the actual V2.5 deployment path (V2.5's seg_la backend has its own `decay_scales` initialization that I have not been able to locate in the SGLang fork).
+- If numerical parity fails on the linear-attn branch, swap to SGLang's formula and re-test. This is a **single-line change in the converter** (`(il - 1)` → `il`).
 
 ---
 
@@ -109,7 +128,63 @@ The slope tensor is small (`[32]` per layer × 28 layers = 896 F32 values total)
 
 ---
 
-## 4. Open questions worth flagging to upstream reviewers
+## 4. Findings from SGLang reference (antgroup/sglang `ling_2_6` branch)
+
+Here are the deployment-canonical conventions, drawn from `models/bailing_moe_linear.py`, `models/bailing_moe_nextn.py`, `configs/bailing_hybrid.py`, and `layers/attention/linear/{seg_la.py, lightning_attn.py, lightning_backend.py}`:
+
+### 4.1 Recurrent state geometry
+Mamba2-style state per layer: shape `[B, num_heads, head_dim, head_dim]` = `[B, 32, 128, 128]` for Ling-2.6-flash. **No conv1d** (unlike Kimi KDA). `n_embd_s = 524288` per sequence per layer (~2 MiB at F32). Confirmed.
+
+### 4.2 RoPE conventions
+- Linear-attn: `is_neox_style=True` → ggml `GGML_ROPE_TYPE_NEOX`. Applied on partial dim (rotary_dim = head_dim * partial_rotary_factor = 64).
+- MLA: `is_neox_style = not config.rope_interleave`. With `rope_interleave=True` → `is_neox_style=False` → ggml mode 0 (default/interleaved). Applied only on `qk_rope_head_dim=64` of the q_pe / k_pe slice.
+
+### 4.3 Linear-attn forward (canonical)
+```
+qkv = QKV(x).to(float32)         # cast to F32 for numerical stability
+q, k, v = split(qkv, ...)
+if use_qk_norm: q,k = RMSNorm_per_head(q,k)
+q, k = rotary_emb_neox(positions, q, k)   # only first 64 of head_dim rotated
+# q is NOT explicitly scaled here; the kernel applies softmax_scale = head_dim^(-0.5) internally
+hidden = seg_la_attn(q, k, v, decay_scales, state)
+gate = g_proj(hidden_states_input)        # NB: input to attention block, NOT post-attn
+hidden = g_norm(hidden, gate)             # fused RMSNormGated with sigmoid activation
+hidden = dense(hidden)
+```
+
+For our ggml graph we'll pre-scale q in the builder (so the scan op signature stays clean), use F32 for the QKV matmuls, and split the fused `RMSNormGated` into separate `ggml_rms_norm` + `ggml_mul(sigmoid(gate))`.
+
+### 4.4 GroupRMSNorm semantics
+```
+x_grouped = rearrange(x, "... (g d) -> ... g d", d=group_size)
+rstd = 1 / sqrt(x_grouped.square().mean(dim=-1, keepdim=True) + eps)
+```
+With `group_size = hidden / group_norm_size = 4096 / 4 = 1024` (channels per group). RMS computed over the 1024-channel inner axis. **Multiplied by per-channel weight `[hidden]`.**
+
+In ggml: reshape `[hidden, T*B]` → `[1024, 4, T*B]`, `ggml_rms_norm` over axis 0, reshape back, `ggml_mul` with weight.
+
+### 4.5 MTP (NEXTN) details
+- `BailingMoEModelNextN` has its own `enorm`, `hnorm`, `eh_proj`, `final_layernorm`, ONE decoder layer (always MLA, `attention_type=1`), and a `lm_head` that is **runtime-tied** to the main model's `lm_head` via `set_embed_and_head` (used by SGLang's eagle_worker for speculative decoding).
+- The MTP file `model-mtp-layer.safetensors` has NO `embed_tokens` and NO `lm_head` — confirmed by tensor index and matches SGLang's tying logic.
+- SGLang exposes MTP via `--speculative-algorithm NEXTN` with `--speculative-num-steps 3`, `--speculative-num-draft-tokens 4`. In llama.cpp, MTP integration with the speculative-decoding API is a **follow-up PR**; the V1 PR will load and graph-build the MTP layer but not hook it into draft sampling.
+- **MTP MLA layer**: same q-LoRA / kv-LoRA dimensions as main MLA layers. Same `kv_b_proj` split applies.
+- **Tool-call format**: SGLang uses `--tool-call-parser qwen25`, suggesting the V2.5 chat template's tool-call XML format is qwen2.5-compatible.
+
+### 4.6 SGLang weight-loader transformations (informational)
+- `attention.dense → attention.out_proj` for linear-attn layers; `attention.dense → attention.o_proj` for MLA layers (and MTP). Both originate from the same checkpoint name. We don't need to mirror this rename in our converter; our schema uses one `ATTN_OUT` for both.
+- `q_a_proj` and `kv_a_proj_with_mqa` are fused into `fused_qkv_a_proj_with_mqa` at runtime when `q_lora_rank` is set. **Performance optimization, not required for correctness**. Defer to follow-up PR if profiling shows it matters.
+- `slope` keys are explicitly skipped during weight loading (`if "slope" in name: continue`). Slopes are **not in the checkpoint** — they are non-persistent buffers per HF `register_buffer(persistent=False)`. We synthesize them at convert time. Already in plan.
+
+### 4.7 Long-context: YARN at runtime, not at convert
+The HF `config.json` has `rope_scaling: null` and `max_position_embeddings: 131072`. The README's recommended SGLang launch command overrides at runtime to:
+```
+rope_scaling = { rope_type: "yarn", factor: 2.0, rope_theta: 6000000, partial_rotary_factor: 0.5, original_max_position_embeddings: 131072 }
+```
+Yielding 262144 effective context. **This is a deployment-time override, not embedded in the checkpoint.** Our converter should NOT bake YARN; the resulting GGUF will inherit `max_position_embeddings = 131072` and standard rope. Users can override via llama-cli's `--rope-scaling` / `--rope-freq-scale` runtime flags (or by patching the GGUF metadata) to enable YARN context extension.
+
+Document this in the README/usage notes when shipping.
+
+## 5. Open questions worth flagging to upstream reviewers
 
 ### 4.1 Should `simple_gla_scan` live in ggml core or a new `ggml-fla` (flash-linear-attn) bucket?
 KDA, RWKV6/7, Mamba SSM scan, and Qwen3-Next gated-delta-net all live alongside each other in `ggml-cpu/ops/`. New op fits the same bucket. No new namespace needed.
@@ -136,7 +211,7 @@ Recommend (a) **as a separate refactor PR before** the V2.5 PR, to keep diffs re
 
 ---
 
-## 5. Verification protocol rationale
+## 6. Verification protocol rationale
 
 ### 5.1 Why F32 for parity testing
 Hybrid recurrent-attention models accumulate FP errors over the sequence length. BF16 vs F16 vs F32 each give different cumulative drift. F32 on both reference and our implementation removes one source of variance and isolates algorithmic correctness.

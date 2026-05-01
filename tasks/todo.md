@@ -60,10 +60,14 @@ Companion document: `tasks/review-findings.md` (open decisions, prior-plan corre
 ### 2.2 `set_gguf_parameters` ✅
 - [x] Force `num_key_value_heads=1` before super (mirrors KimiLinear).
 - [x] `setdefault("norm_topk_prob", True)` for the missing V2.5 config key.
-- [x] Per-layer `head_count_kv` list (28 zeros + 4 ones for L=32 G=8, plus 1 for MTP).
+- [x] Per-layer `head_count_kv` list using SGLang's simpler predicate `(il+1) % G != 0`.
+  Asserts `L % G == 0` (matches SGLang's deployment assumption). Tail clause from
+  HF reference dropped (would never fire for L=32 G=8 anyway).
 - [x] MLA KVs: `add_q_lora_rank`, `add_kv_lora_rank`, `add_key_length_mla`, `add_value_length_mla`.
 - [x] MoE / leading-dense / expert-weights / nextn KVs inherited from V2 super.
-- [x] `add_group_norm_groups((n_head * head_dim) // group_norm_size)`.
+- [x] `add_group_norm_groups(hparams["group_norm_size"])` — stores **number of groups** (=4),
+  not channels-per-group. Verified semantics against SGLang `fla.RMSNormGated` and HF
+  `BailingMoeV2_5GroupRMSNorm.forward`. See `review-findings.md` §1#9 and §4.4.
 - [x] `add_rope_dimension_count` inherited from V2 super (head_dim * partial_rotary_factor = 64).
 - [x] `add_rope_freq_base` inherited from TextModel super (reads `rope_theta=6_000_000`).
 
@@ -201,22 +205,26 @@ if (hparams.is_recurrent(il)) {
 
 ### 5.4 Linear attention branch (`build_linear_attn`)
 - [ ] Fused QKV: `qkv = ggml_mul_mat(layer.attn_qkv, cur)`. Shape `[16384, T, B]`.
+  **Cast to F32** to match SGLang's numerical precision (`qkv = qkv.to(float32)`); ggml will keep it F32 through the scan.
 - [ ] Reshape & split: `q[D=128, H=32, T, B]`, `k[D=128, H=32, T, B]`, `v[D=128, H=32, T, B]` (kv_heads_for_linear == n_heads in this checkpoint; assert).
 - [ ] **QK-norm** (per-head RMSNorm over `D=128`): `q = build_norm(q, layer.attn_q_norm, NULL, LLM_NORM_RMS, il)`; same for `k` with `attn_k_norm`. Weight shape `[128]`.
-- [ ] **RoPE on first 64 dims, NeoX (split-half) layout**: `q_rope = ggml_rope_ext(q, ..., n_rot=64, mode=GGML_ROPE_TYPE_NEOX, freq_base=6e6, ...)`. Same for `k`. (HF's linear-attn uses `apply_rotary_pos_emb`, the split-half variant.)
-- [ ] Load `g = layer.attn_g_decay` (already F32, shape `[32]`).
+- [ ] **RoPE on first 64 dims, NeoX (split-half) layout**: `q_rope = ggml_rope_ext(q, ..., n_rot=64, mode=GGML_ROPE_TYPE_NEOX, freq_base=6e6, ...)`. Same for `k`. (Confirmed via SGLang `is_neox_style=True` for linear-attn.)
+- [ ] **Pre-scale q** by `1/sqrt(head_dim)`. Rationale: SGLang's `seg_la` kernel applies `softmax_scale = head_dim^(-0.5)` internally; we apply it explicitly before our scan op so the op signature stays clean. `q = ggml_scale(q, 1.0/sqrt(head_dim))`.
+- [ ] Load `g = layer.attn_g_decay` (already F32, shape `[32]`, already negated per HF/fla convention; see `review-findings.md` §2.5).
 - [ ] Get/build state: `state = build_rs(inp_rs, mctx_cur->get_s_l(il), n_embd_s(), n_seqs)`, reshape to `[D_k=128, D_v=128, H=32, n_seqs]`.
 - [ ] **Run new op**: `o = ggml_simple_gla_scan(ctx0, q, k, v, g, state)` — output `[128, 32, T, B]`, state updated.
-- [ ] **GroupRMSNorm** (group size = 4):
+- [ ] **GroupRMSNorm** (4 groups of 1024 channels each — see `review-findings.md` §4.4):
     ```cpp
     // o has shape [4096, T*B] flattened
-    // Reshape to [4, 1024, T*B] so ggml_rms_norm normalizes the inner-4 axis
-    o = ggml_reshape_3d(ctx0, o, 4, 1024, n_tokens);
+    // Reshape to [1024, 4, T*B] so ggml_rms_norm normalizes the inner-1024 axis
+    // (each of the 4 groups gets normalized independently over its 1024 channels)
+    o = ggml_reshape_3d(ctx0, o, 1024, 4, n_tokens);
     o = ggml_rms_norm(ctx0, o, eps);
     o = ggml_reshape_2d(ctx0, o, 4096, n_tokens);
     o = ggml_mul(ctx0, o, layer.attn_g_norm);  // per-channel learned scale [4096]
     ```
-- [ ] **Sigmoid output gate**: `g_proj_out = ggml_mul_mat(layer.attn_g_proj, x_norm)`; `o = o * sigmoid(g_proj_out)`. `x_norm` is the input-layernorm output (NOT the post-attention output).
+  (NB: dimensions above are reversed for clarity — in actual ggml code they appear as `ne[0]=1024, ne[1]=4, ne[2]=n_tokens` reflecting ggml's reverse-of-numpy convention.)
+- [ ] **Sigmoid output gate**: `g_proj_out = ggml_mul_mat(layer.attn_g_proj, x_norm)`; `o = o * sigmoid(g_proj_out)`. `x_norm` is the input-layernorm output (NOT the post-attention output). Equivalent to SGLang's fused `RMSNormGated(activation="sigmoid")`.
 - [ ] **Dense output**: `o = ggml_mul_mat(layer.attn_out, o)`.
 - [ ] State writeback handled by `build_rs` machinery (mirror kimi-linear).
 
@@ -306,3 +314,21 @@ mtp_logits = ggml_mul_mat(model.output, x);  // SHARED lm_head
 - [ ] Open a feature-request issue on `ggml-org/llama.cpp` first (none exists for V2.5) to allow upstream review of the new op signature before deep implementation.
 - [ ] Split into two PRs if reviewer requests: (1) `ggml_simple_gla_scan` op + tests, (2) BailingMoeV2.5 model integration consuming the op.
 - [ ] Mark GPU backends as TODO in PR description if shipping CPU-only; track in a follow-up issue.
+
+## Phase 8: Long-context (YARN) and MTP integration (follow-up PRs)
+
+These are **deliberately deferred** out of the V1 PR to keep its scope reviewable. Capture them as separate follow-ups.
+
+### 8.1 YARN at runtime (not at convert)
+- HF config has `rope_scaling: null` and `max_position_embeddings: 131072` (the trained context).
+- SGLang README recommends overriding at launch with `rope_scaling = {rope_type: "yarn", factor: 2.0, original_max_position_embeddings: 131072}` for 262144 effective context.
+- **Decision**: do NOT bake YARN into the converter. Document in README that long-context (>131k) requires user to enable YARN via llama-cli flags or by patching GGUF metadata. Verify llama.cpp's existing YARN support handles this configuration unchanged.
+- See `review-findings.md` §4.7.
+
+### 8.2 MTP / NEXTN speculative decoding
+- V1 PR loads MTP weights and graph-builds the MTP layer, but does NOT hook into the speculative-decoding API. The `mtp_logits` output is computed and discarded (matches the existing DeepSeek-V3 / GLM-4.5 pattern).
+- Follow-up PR: integrate MTP as draft-token source in llama.cpp's speculative decoding API. Reference: SGLang `--speculative-algorithm NEXTN` / `--speculative-num-steps 3` / `--speculative-num-draft-tokens 4`. EAGLE-3 / NEXTN style.
+
+### 8.3 `fused_qkv_a_proj_with_mqa` MLA optimization
+- SGLang fuses `q_a_proj + kv_a_proj_with_mqa` into one matmul (`fused_qkv_a_proj_with_mqa`). For Ling-2.6-flash this is `[hidden=4096] -> [q_lora_rank + kv_lora_rank + qk_rope_head_dim = 1536 + 512 + 64 = 2112]`.
+- V1 keeps them separate. Profile and decide whether the fusion is worth a follow-up converter + graph change.
