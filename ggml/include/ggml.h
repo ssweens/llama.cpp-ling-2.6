@@ -561,6 +561,7 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_SIMPLE_GLA_SCAN,
 
         GGML_OP_UNARY,
 
@@ -2537,6 +2538,22 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * g,
             struct ggml_tensor  * beta,
+            struct ggml_tensor  * state);
+
+    // Simple GLA / Lightning-Attention-2 scan.
+    // q,k:   [D_k, H, T, B] F32
+    // v:     [D_v, H, T, B] F32
+    // g:     [H] F32, per-head log-decay; already negative/pre-ramped by converter
+    // state: [D_k, D_v, H, B] F32 input recurrent state
+    // Returns a packed F32 tensor:
+    //   output:    first D_v*H*T*B elements, viewable as [D_v, H, T, B]
+    //   new_state: remaining D_k*D_v*H*B elements, viewable as [D_k, D_v, H, B]
+    GGML_API struct ggml_tensor * ggml_simple_gla_scan(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
             struct ggml_tensor  * state);
 
     // custom operators

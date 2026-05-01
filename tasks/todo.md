@@ -134,46 +134,50 @@ Companion document: `tasks/review-findings.md` (open decisions, prior-plan corre
 
 ## Phase 4: New ggml operator `ggml_simple_gla_scan`
 
-### 4.1 API
-- [ ] Add to `ggml/include/ggml.h`:
+### 4.1 API ✅
+- [x] Add to `ggml/include/ggml.h`:
     ```c
     GGML_API struct ggml_tensor * ggml_simple_gla_scan(
         struct ggml_context * ctx,
-        struct ggml_tensor  * q,        // [D_k, H, T, B] F32/F16
-        struct ggml_tensor  * k,        // [D_k, H, T, B]
-        struct ggml_tensor  * v,        // [D_v, H, T, B]
+        struct ggml_tensor  * q,        // [D_k, H, T, B] F32
+        struct ggml_tensor  * k,        // [D_k, H, T, B] F32
+        struct ggml_tensor  * v,        // [D_v, H, T, B] F32
         struct ggml_tensor  * g,        // [H]            F32 — log-decay per head (already negative)
-        struct ggml_tensor  * state);   // [D_k, D_v, H, B] F32 — IN/OUT
+        struct ggml_tensor  * state);   // [D_k, D_v, H, B] F32 — input state
     ```
-- [ ] Output: `[D_v, H, T, B]`. State updated in-place (or via `ggml_cpy` pattern, mirroring `ggml_kda_scan`).
+- [x] Return a packed F32 tensor, mirroring `ggml_gated_delta_net`:
+    - first `D_v * H * T * B` elements: output viewable as `[D_v, H, T, B]`
+    - remaining `D_k * D_v * H * B` elements: new state viewable as `[D_k, D_v, H, B]`
+    - Phase 5 graph builder will slice the new-state view and copy it back with `ggml_cpy`.
 
-### 4.2 Mathematical contract
+### 4.2 Mathematical contract ✅
 Per `(b, h)` independently, iterating `t = 0..T-1`:
 ```
 S ← exp(g[h]) · S + outer(k[:,h,t,b], v[:,h,t,b])     # S: [D_k, D_v]
 o[:,h,t,b] ← S^T · q[:,h,t,b]                          # [D_v]
 ```
-Initial `S` taken from the input `state` tensor. Final `S` written back to `state`.
+Initial `S` taken from the input `state` tensor. Final `S` is returned in the packed new-state region (Phase 5 copies it back to recurrent memory).
 
 **`g` is pre-negated and pre-ramped** (the slope baking from §2.3 produces `g` directly usable here).
 
-### 4.3 Mode dispatch (matches HF)
-- [ ] If `T <= 64`: recurrent path (sequential per-token loop). Optimal for decode.
-- [ ] If `T > 64`: chunked path (block size 64 typical) — per-chunk matmul accumulation. Optimal for prefill.
+### 4.3 Mode dispatch (matches HF) ✅ for V1 reference / follow-up for perf
+- [x] V1 CPU reference uses the recurrent/sequential loop for all `T`. This is correct and sufficient for Phase 5 functional bring-up.
+- [ ] Follow-up optimization: if `T > 64`, add a chunked path (block size 64 typical) for prefill throughput.
 
-### 4.4 CPU kernel (`ggml/src/ggml-cpu/`)
-- [ ] Reference implementation in `ggml-cpu.c` (or new `ggml-cpu/ops/simple-gla.c`).
-- [ ] Follow the layout of `ggml_kda_scan` / `ggml_rwkv_wkv6` for thread sharding (typically thread per `(B, H)` pair).
-- [ ] F32 accumulation, F32 state storage (regardless of input dtype).
+### 4.4 CPU kernel (`ggml/src/ggml-cpu/`) ✅
+- [x] Reference implementation in `ggml/src/ggml-cpu/ops.cpp`.
+- [x] Follow `ggml_gated_delta_net` sharding pattern: parallel chunks over `(B, H)` pairs.
+- [x] F32 accumulation and F32 state/output storage. V1 API accepts F32 inputs; Phase 5 graph casts QKV to F32 before calling the op.
 
 ### 4.5 GPU kernels (defer to follow-up PR if needed)
 - [ ] CUDA: model after `ggml/src/ggml-cuda/kda.cu` or `wkv6.cu`. Tile per `(B, H)`, register-tile the state.
 - [ ] Metal: similar.
 - [ ] Vulkan/SYCL: lower priority.
 
-### 4.6 Tests
-- [ ] Add unit test in `tests/test-backend-ops.cpp` comparing CPU output against a numpy/python reference for random inputs at `T ∈ {1, 8, 64, 128, 1024}`.
-- [ ] Numerical tolerance: rtol=1e-4, atol=1e-5 in F32.
+### 4.6 Tests ✅
+- [x] Add a dedicated CPU reference test (`tests/test-simple-gla.cpp`) that compares packed op output + final state against a direct C++ reference for deterministic inputs at `T ∈ {1, 4, 8}` and `B ∈ {1, 2}`.
+- [x] Add `tests/test-backend-ops.cpp` coverage so backend support/perf harness can see `GGML_OP_SIMPLE_GLA_SCAN`.
+- [x] Numerical tolerance: rtol=1e-4, atol=1e-5 in F32.
 
 ---
 

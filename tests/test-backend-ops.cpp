@@ -3772,6 +3772,34 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_SIMPLE_GLA_SCAN
+struct test_simple_gla_scan : public test_case {
+    const int64_t head_count;
+    const int64_t head_size_k;
+    const int64_t head_size_v;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    std::string vars() override {
+        return VARS_TO_STR5(head_count, head_size_k, head_size_v, n_seq_tokens, n_seqs);
+    }
+
+    test_simple_gla_scan(
+            int64_t head_count = 4, int64_t head_size_k = 16, int64_t head_size_v = 16,
+            int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
+        : head_count(head_count), head_size_k(head_size_k), head_size_v(head_size_v),
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size_k, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size_k, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size_v, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_count);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size_k, head_size_v, head_count, n_seqs);
+        return ggml_simple_gla_scan(ctx, q, k, v, g, state);
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -8800,6 +8828,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
+
+    test_cases.emplace_back(new test_simple_gla_scan(4, 16, 16, 1, 1));
+    test_cases.emplace_back(new test_simple_gla_scan(4, 16, 16, 8, 1));
+    test_cases.emplace_back(new test_simple_gla_scan(2, 8, 4, 4, 2));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

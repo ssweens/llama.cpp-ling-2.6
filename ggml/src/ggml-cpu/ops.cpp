@@ -10615,6 +10615,129 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+// ggml_compute_forward_simple_gla_scan
+
+static void ggml_compute_forward_simple_gla_scan_one_chunk(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        int64_t ir0,
+        int64_t ir1) {
+    const ggml_tensor * src_q     = dst->src[0];
+    const ggml_tensor * src_k     = dst->src[1];
+    const ggml_tensor * src_v     = dst->src[2];
+    const ggml_tensor * src_g     = dst->src[3];
+    const ggml_tensor * src_state = dst->src[4];
+
+    const int64_t D_k      = src_q->ne[0];
+    const int64_t H        = src_q->ne[1];
+    const int64_t n_tokens = src_q->ne[2];
+    const int64_t n_seqs   = src_q->ne[3];
+    const int64_t D_v      = src_v->ne[0];
+
+    GGML_ASSERT(ggml_is_contiguous_rows(src_q));
+    GGML_ASSERT(ggml_is_contiguous_rows(src_k));
+    GGML_ASSERT(ggml_is_contiguous_rows(src_v));
+    GGML_ASSERT(ggml_is_contiguous(src_g));
+    GGML_ASSERT(ggml_is_contiguous(src_state));
+
+    GGML_TENSOR_LOCALS(size_t, nbq, src_q, nb);
+    GGML_TENSOR_LOCALS(size_t, nbk, src_k, nb);
+    GGML_TENSOR_LOCALS(size_t, nbv, src_v, nb);
+
+    const int64_t output_elems = D_v * H * n_tokens * n_seqs;
+    float * output_base = (float *) dst->data;
+    float * state_base  = (float *) dst->data + output_elems;
+
+    const float * g_base     = (const float *) src_g->data;
+    const float * state_in   = (const float *) src_state->data;
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t ih = ir % H;
+        const int64_t ib = ir / H;
+
+        const float decay = expf(g_base[ih]);
+
+        float * s_out = state_base + (ib * H + ih) * D_k * D_v;
+        const float * s_in = state_in + (ib * H + ih) * D_k * D_v;
+        memcpy(s_out, s_in, D_k * D_v * sizeof(float));
+
+        for (int64_t it = 0; it < n_tokens; ++it) {
+            const float * q = (const float *) ((const char *) src_q->data + ib * nbq3 + it * nbq2 + ih * nbq1);
+            const float * k = (const float *) ((const char *) src_k->data + ib * nbk3 + it * nbk2 + ih * nbk1);
+            const float * v = (const float *) ((const char *) src_v->data + ib * nbv3 + it * nbv2 + ih * nbv1);
+
+            // State layout is [D_k, D_v, H, B], so each value-channel row
+            // stores S[:, j] contiguously. This makes S^T q a row-wise dot.
+            for (int64_t j = 0; j < D_v; ++j) {
+                float * s_row = s_out + j * D_k;
+                ggml_vec_scale_f32(D_k, s_row, decay);
+                ggml_vec_mad_f32(D_k, s_row, k, v[j]);
+            }
+
+            float * out = output_base + ((ib * n_tokens + it) * H + ih) * D_v;
+            for (int64_t j = 0; j < D_v; ++j) {
+                float sum = 0.0f;
+                ggml_vec_dot_f32(D_k, &sum, 0, s_out + j * D_k, 0, q, 0, 1);
+                out[j] = sum;
+            }
+        }
+    }
+
+    GGML_UNUSED(params);
+}
+
+static void ggml_compute_forward_simple_gla_scan_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const int64_t nr = q->ne[1] * q->ne[3];
+
+    const int nth = params->nth;
+    const int ith = params->ith;
+
+    int nth_scaled = nth * 4;
+    int64_t chunk_size = (nr + nth_scaled - 1) / nth_scaled;
+    int64_t nchunk     = (nr + chunk_size - 1) / chunk_size;
+
+    if (nth == 1 || nchunk < nth || ggml_is_numa()) {
+        nchunk = nth;
+    }
+
+    if (ith == 0) {
+        ggml_threadpool_chunk_set(params->threadpool, nth);
+    }
+
+    ggml_barrier(params->threadpool);
+
+    const int64_t dr = (nr + nchunk - 1) / nchunk;
+
+    int current_chunk = ith;
+    while (current_chunk < nchunk) {
+        const int64_t ir0 = dr * current_chunk;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+
+        ggml_compute_forward_simple_gla_scan_one_chunk(params, dst, ir0, ir1);
+        current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+    }
+}
+
+void ggml_compute_forward_simple_gla_scan(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_simple_gla_scan_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

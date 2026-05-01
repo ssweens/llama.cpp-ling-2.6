@@ -757,6 +757,20 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, 1};
     };
 
+    auto handle_simple_gla_scan = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+            src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+            src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return src_ss[0];
+        }
+        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_2);
+        return {GGML_BACKEND_SPLIT_AXIS_0, {0}, 1};
+    };
+
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, 1};
@@ -956,6 +970,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             } break;
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
+            } break;
+            case GGML_OP_SIMPLE_GLA_SCAN: {
+                split_state = handle_simple_gla_scan(src_ss);
             } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
