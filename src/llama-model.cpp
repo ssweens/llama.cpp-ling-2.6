@@ -2556,11 +2556,18 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     hparams.recurrent_layer_arr[i] = (hparams.n_head_kv(i) == 0);
                 }
 
+                // Absorbed MLA stores [kv_lora_rank + qk_rope_head_dim] in the KV cache.
+                // Older GGUFs produced before Phase 5 validation may still have the base
+                // attention key length (128); normalize it here so they remain loadable.
+                hparams.n_embd_head_k_full = hparams.n_lora_kv + hparams.n_rot();
+
                 // Recurrent simple-GLA state shape is [n_head, head_dim_k, head_dim_v],
                 // flattened for llama_memory_recurrent as n_embd_s() = ssm_d_state * ssm_d_inner.
-                // No conv/R-state is used because ssm_d_conv remains 0.
-                hparams.ssm_d_state = hparams.n_embd_head_k();
-                hparams.ssm_d_inner = hparams.n_head() * hparams.n_embd_head_v();
+                // Linear-attn head_dim is hidden/n_head (128), independent of the absorbed MLA
+                // cache key length above. No conv/R-state is used because ssm_d_conv remains 0.
+                const uint32_t linear_head_dim = hparams.n_embd / hparams.n_head();
+                hparams.ssm_d_state = linear_head_dim;
+                hparams.ssm_d_inner = hparams.n_head() * linear_head_dim;
 
                 switch (hparams.n_layer) {
                     // Ling-2.6-flash: 32 transformer + 1 MTP = 33 total
@@ -6726,8 +6733,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     const int64_t qk_rope_head_dim  = hparams.n_rot();  // partial rotary on first n_rot dims
                     const int64_t qk_nope_head_dim  = n_embd_head_k_mla - qk_rope_head_dim;
 
-                    // Linear-attn dimensions (per-layer head_dim, n_kv == n_head)
-                    const int64_t la_head_dim      = hparams.n_embd_head_k();  // 128 for Ling-2.6-flash (per-layer; same across all layers here)
+                    // Linear-attn dimensions (per-layer head_dim, n_kv == n_head). This is
+                    // independent of the absorbed-MLA KV-cache key length stored in hparams.
+                    const int64_t la_head_dim      = n_embd / n_head;  // 128 for Ling-2.6-flash
 
                     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
                     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
@@ -9108,14 +9116,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             } break;
         case LLM_ARCH_BAILINGMOE2_5:
             {
-                // TODO(Phase 5): graph builder pending implementation alongside
-                // the new ggml_simple_gla_scan operator (Phase 4). Loading a
-                // bailingmoe2.5 model will succeed (tensors map correctly) but
-                // inference is not yet wired.
-                throw std::runtime_error(
-                    "bailingmoe2.5 (Ling-2.6-flash family) graph builder is not yet "
-                    "implemented in this build. Loading succeeded but inference is "
-                    "not available; track Phase 4-5 in tasks/todo.md.");
+                llm = std::make_unique<llm_build_bailingmoe2_5>(*this, params);
             } break;
         case LLM_ARCH_SEED_OSS:
             {

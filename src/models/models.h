@@ -138,6 +138,10 @@ struct llm_build_bailingmoe2 : public llm_graph_context {
     llm_build_bailingmoe2(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_bailingmoe2_5 : public llm_graph_context {
+    llm_build_bailingmoe2_5(const llama_model & model, const llm_graph_params & params);
+};
+
 struct llm_build_bailingmoe : public llm_graph_context {
     llm_build_bailingmoe(const llama_model & model, const llm_graph_params & params);
 };

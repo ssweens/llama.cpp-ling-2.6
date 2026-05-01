@@ -113,7 +113,7 @@ Companion document: `tasks/review-findings.md` (open decisions, prior-plan corre
 - [x] Add `attn_g_proj`, `attn_g_norm`, `attn_g_decay` tensor pointers to `struct llama_layer`.
 
 ### 3.3 `src/llama-model.cpp` ✅ (loader; graph dispatch stubbed)
-- [x] `load_hparams` case for `LLM_ARCH_BAILINGMOE2_5`: reads V2 MoE KVs + MLA dims (key_length_mla, value_length_mla, q_lora_rank, kv_lora_rank) + group_norm_groups. Populates `recurrent_layer_arr`. Sets simple-GLA recurrent state via existing SSM fields (`ssm_d_state=128`, `ssm_d_inner=4096`, so `n_embd_s=524288`; `ssm_d_conv=0`, so `n_embd_r=0`). Type detection by n_layer (32 or 33 → LLM_TYPE_100B_A6B for Ling-2.6-flash).
+- [x] `load_hparams` case for `LLM_ARCH_BAILINGMOE2_5`: reads V2 MoE KVs + MLA dims (key_length_mla, value_length_mla, q_lora_rank, kv_lora_rank) + group_norm_groups. Populates `recurrent_layer_arr`. Normalizes absorbed-MLA KV-cache key width to `kv_lora_rank + n_rot = 576` while keeping linear-attn head_dim as `hidden/n_head = 128`. Sets simple-GLA recurrent state via existing SSM fields (`ssm_d_state=128`, `ssm_d_inner=4096`, so `n_embd_s=524288`; `ssm_d_conv=0`, so `n_embd_r=0`). Type detection by n_layer (32 or 33 → LLM_TYPE_100B_A6B for Ling-2.6-flash).
 - [x] `load_tensors` case dispatches per-layer on `is_mtp` and `is_recurrent`:
     - Linear-attn: attn_qkv, attn_out, attn_q_norm, attn_k_norm, attn_g_proj, attn_g_norm, attn_g_decay.
     - MLA (and MTP): wq_a, attn_q_a_norm, wq_b, wkv_a_mqa, attn_kv_a_norm, wkv_b + wk_b + wv_b (converter emits all three; graph can choose absorbed path), wo.
@@ -183,14 +183,16 @@ Initial `S` taken from the input `state` tensor. Final `S` is returned in the pa
 
 ## Phase 5: Graph builder `src/models/bailingmoe2_5.cpp`
 
-### 5.1 Skeleton
-- [ ] Subclass `llm_graph_context` (NOT `llm_build_delta_net_base` — we don't use the delta-net algebra). Mirror `llm_build_kimi_linear` for the hybrid-memory bookkeeping.
-- [ ] Header: declare `llm_build_bailingmoe2_5` in `src/models/models.h`.
+### 5.1 Skeleton ✅
+- [x] Subclass `llm_graph_context` (NOT `llm_build_delta_net_base` — we don't use the delta-net algebra). Mirror `llm_build_kimi_linear` for the hybrid-memory bookkeeping.
+- [x] Header: declare `llm_build_bailingmoe2_5` in `src/models/models.h`.
+- [x] Add `src/models/bailingmoe2_5.cpp` and wire `LLM_ARCH_BAILINGMOE2_5` graph dispatch in `llama-model.cpp`.
 
-### 5.2 Hybrid memory setup (copy verbatim from `kimi-linear.cpp`)
-- [ ] `auto * inp_k = build_inp_mem_hybrid_k();`
-- [ ] `auto * inp_rs = inp_k->get_recr();`
-- [ ] `auto * inp_attn_k = inp_k->get_attn();`
+### 5.2 Hybrid memory setup ✅
+- [x] `auto * inp_k = build_inp_mem_hybrid_k();`
+- [x] `auto * inp_rs = inp_k->get_recr();`
+- [x] `auto * inp_attn_k = inp_k->get_attn();`
+- [x] Context-init smoke confirms 4 MLA KV-cache layers (7/15/23/31), MTP layer 32 without KV cache, and 28 recurrent layers with 56 MiB RS buffer.
 - [ ] **Position tracking**: anchor `past_seen_tokens` on the MLA layer cache (`get_seq_length(layer_idx = layer_group_size - 1)`) — exactly as kimi-linear does, otherwise positions drift between branches.
 
 ### 5.3 Per-layer dispatch
@@ -206,44 +208,34 @@ if (hparams.is_recurrent(il)) {
 // residual + FFN/MoE block
 ```
 
-### 5.4 Linear attention branch (`build_linear_attn`)
-- [ ] Fused QKV: `qkv = ggml_mul_mat(layer.attn_qkv, cur)`. Shape `[3 * n_head * head_dim = 12288, T, B]`.
+### 5.4 Linear attention branch (`build_linear_attn`) ✅
+- [x] Fused QKV: `qkv = ggml_mul_mat(layer.attn_qkv, cur)`. Shape `[3 * n_head * head_dim = 12288, T, B]`.
   **Cast to F32** to match SGLang's numerical precision (`qkv = qkv.to(float32)`); ggml will keep it F32 through the scan.
-- [ ] Reshape & split: `q[D=128, H=32, T, B]`, `k[D=128, H=32, T, B]`, `v[D=128, H=32, T, B]` (kv_heads_for_linear == n_heads in this checkpoint; assert).
-- [ ] **QK-norm** (per-head RMSNorm over `D=128`): `q = build_norm(q, layer.attn_q_norm, NULL, LLM_NORM_RMS, il)`; same for `k` with `attn_k_norm`. Weight shape `[128]`.
-- [ ] **RoPE on first 64 dims, NeoX (split-half) layout**: `q_rope = ggml_rope_ext(q, ..., n_rot=64, mode=GGML_ROPE_TYPE_NEOX, freq_base=6e6, ...)`. Same for `k`. (Confirmed via SGLang `is_neox_style=True` for linear-attn.)
-- [ ] **Pre-scale q** by `1/sqrt(head_dim)`. Rationale: SGLang's `seg_la` kernel applies `softmax_scale = head_dim^(-0.5)` internally; we apply it explicitly before our scan op so the op signature stays clean. `q = ggml_scale(q, 1.0/sqrt(head_dim))`.
-- [ ] Load `g = layer.attn_g_decay` (already F32, shape `[32]`, already negated per HF/fla convention; see `review-findings.md` §2.5).
-- [ ] Get/build state: `state = build_rs(inp_rs, mctx_cur->get_s_l(il), n_embd_s(), n_seqs)`, reshape to `[D_k=128, D_v=128, H=32, n_seqs]`.
-- [ ] **Run new op**: `o = ggml_simple_gla_scan(ctx0, q, k, v, g, state)` — output `[128, 32, T, B]`, state updated.
-- [ ] **GroupRMSNorm** (4 groups of 1024 channels each — see `review-findings.md` §4.4):
-    ```cpp
-    // o has shape [4096, T*B] flattened
-    // Reshape to [1024, 4, T*B] so ggml_rms_norm normalizes the inner-1024 axis
-    // (each of the 4 groups gets normalized independently over its 1024 channels)
-    o = ggml_reshape_3d(ctx0, o, 1024, 4, n_tokens);
-    o = ggml_rms_norm(ctx0, o, eps);
-    o = ggml_reshape_2d(ctx0, o, 4096, n_tokens);
-    o = ggml_mul(ctx0, o, layer.attn_g_norm);  // per-channel learned scale [4096]
-    ```
-  (NB: dimensions above are reversed for clarity — in actual ggml code they appear as `ne[0]=1024, ne[1]=4, ne[2]=n_tokens` reflecting ggml's reverse-of-numpy convention.)
-- [ ] **Sigmoid output gate**: `g_proj_out = ggml_mul_mat(layer.attn_g_proj, x_norm)`; `o = o * sigmoid(g_proj_out)`. `x_norm` is the input-layernorm output (NOT the post-attention output). Equivalent to SGLang's fused `RMSNormGated(activation="sigmoid")`.
-- [ ] **Dense output**: `o = ggml_mul_mat(layer.attn_out, o)`.
-- [ ] State writeback handled by `build_rs` machinery (mirror kimi-linear).
+- [x] Reshape & split: `q[D=128, H=32, T, B]`, `k[D=128, H=32, T, B]`, `v[D=128, H=32, T, B]` (kv_heads_for_linear == n_heads in this checkpoint; assert).
+- [x] **QK-norm** (per-head RMSNorm over `D=128`): `q = build_norm(q, layer.attn_q_norm, NULL, LLM_NORM_RMS, il)`; same for `k` with `attn_k_norm`. Weight shape `[128]`.
+- [x] **RoPE on first 64 dims, NeoX (split-half) layout**: `q_rope = ggml_rope_ext(q, ..., n_rot=64, mode=GGML_ROPE_TYPE_NEOX, freq_base=6e6, ...)`. Same for `k`. (Confirmed via SGLang `is_neox_style=True` for linear-attn.)
+- [x] **Pre-scale q** by `1/sqrt(head_dim)`. Rationale: SGLang's `seg_la` kernel applies `softmax_scale = head_dim^(-0.5)` internally; we apply it explicitly before our scan op so the op signature stays clean. `q = ggml_scale(q, 1.0/sqrt(head_dim))`.
+- [x] Load `g = layer.attn_g_decay` (already F32, shape `[32]`, already negated per HF/fla convention; see `review-findings.md` §2.5).
+- [x] Get/build state: `state = build_rs(inp_rs, mctx_cur->get_s_l(il), n_embd_s(), n_seqs)`, reshape to `[D_k=128, D_v=128, H=32, n_seqs]`.
+- [x] **Run new op**: `packed = ggml_simple_gla_scan(ctx0, q, k, v, g, state)`; slice packed output `[128,32,T,B]` and packed new-state `[128,128,32,B]`, then copy new-state back to recurrent memory.
+- [x] **GroupRMSNorm** (4 groups of 1024 channels each — see `review-findings.md` §4.4): implemented as reshape `[1024,4,n_tokens]` → `ggml_rms_norm` → reshape `[4096,n_tokens]` → learned scale `attn_g_norm`.
+- [x] **Sigmoid output gate**: `g_proj_out = ggml_mul_mat(layer.attn_g_proj, x_norm)`; `o = o * sigmoid(g_proj_out)`. `x_norm` is the input-layernorm output (NOT the post-attention output). Equivalent to SGLang's fused `RMSNormGated(activation="sigmoid")`.
+- [x] **Dense output**: `o = ggml_mul_mat(layer.attn_out, o)`.
+- [x] State writeback handled by `build_rs` machinery (mirror kimi-linear).
 
-### 5.5 MLA branch (`build_mla`)
+### 5.5 MLA branch ✅ (`build_mla`)
 Direct adaptation of `src/models/deepseek2.cpp` (with q-LoRA, since `q_lora_rank=1536`).
-- [ ] Q LoRA path: `q = q_b(q_a_norm(q_a(x_norm)))`.
-- [ ] KV compression: `kv_cmpr_pe = kv_a_mqa(x_norm)`; split into `kv_cmpr [512]` and `k_pe [64]`.
-- [ ] Normalize: `kv_cmpr = kv_a_norm(kv_cmpr)`.
-- [ ] **RoPE — interleaved/default mode (NOT NeoX)**: `q_pe = ggml_rope_ext(q_pe, ..., mode=0, freq_base=6e6, ...)`; same for `k_pe`. (HF uses `apply_rotary_pos_emb_interleave` which net-effects to GPT-J interleaved layout.)
+- [x] Q LoRA path: `q = q_b(q_a_norm(q_a(x_norm)))`.
+- [x] KV compression: `kv_cmpr_pe = kv_a_mqa(x_norm)`; split into `kv_cmpr [512]` and `k_pe [64]`.
+- [x] Normalize: `kv_cmpr = kv_a_norm(kv_cmpr)`.
+- [x] **RoPE — interleaved/default mode (NOT NeoX)**: `q_pe = ggml_rope_ext(q_pe, ..., mode=0, freq_base=6e6, ...)`; same for `k_pe`. (HF uses `apply_rotary_pos_emb_interleave` which net-effects to GPT-J interleaved layout.)
     - **Verification step**: numerical-parity test (Phase 6) is the gate. If parity fails on the MLA path, swap the mode flag and/or pre-permute `q_b_proj`/`kv_a_proj_with_mqa` weights at convert time.
-- [ ] **Absorbed-MLA path** (using `wk_b`, `wv_b` from §2.3 split): identical to kimi-linear's MLA branch.
-- [ ] Output projection: `attn_out = dense(attn_output)`.
+- [x] **Absorbed-MLA path** (using `wk_b`, `wv_b` from §2.3 split): identical to kimi-linear's MLA branch. Phase 5 validation found the base KV-cache key length must be `kv_lora_rank + qk_rope_head_dim = 576`, while linear-attn still uses `hidden/n_head = 128`; converter and loader now encode/normalize that.
+- [x] Output projection: `attn_out = dense(attn_output)`.
 
-### 5.6 FFN / MoE block (copy from `bailingmoe2.cpp`)
-- [ ] Layer 0 (`il < hparams.n_layer_dense_lead`): dense `build_ffn` with SiLU.
-- [ ] Other layers: `build_moe_ffn` with `expert_gating_func=sigmoid`, `expert_weights_norm=true`, `expert_weights_scale=2.5`, `n_expert=256`, `n_expert_used=8`. Plus shared expert add.
+### 5.6 FFN / MoE block (copy from `bailingmoe2.cpp`) ✅
+- [x] Layer 0 (`il < hparams.n_layer_dense_lead`): dense `build_ffn` with SiLU.
+- [x] Other layers: `build_moe_ffn` with `expert_gating_func=sigmoid`, `expert_weights_norm=true`, `expert_weights_scale=2.5`, `n_expert=256`, `n_expert_used=8`. Plus shared expert add.
 
 ### 5.7 MTP layer (il = 32)
 After the main residual stream is finalized (post-`output_norm`):
@@ -267,15 +259,20 @@ mtp_logits = ggml_mul_mat(model.output, x);  // SHARED lm_head
 ```
 - [ ] Expose `mtp_logits` separately (mirror DeepSeek-V3 / GLM-4.5 nextn handling).
 
-### 5.8 Output head
-- [ ] `result_norm = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1)`.
-- [ ] `result_output = ggml_mul_mat(model.output, result_norm)` (lm_head; not tied to embeddings).
+### 5.8 Output head ✅
+- [x] `result_norm = build_norm(inpL, model.output_norm, NULL, LLM_NORM_RMS, -1)`.
+- [x] `result_output = ggml_mul_mat(model.output, result_norm)` (lm_head; not tied to embeddings).
+
+### 5.9 Phase 5 smoke status ✅ (main path)
+- [x] CPU-only no-decode context/graph smoke: `./build/bin/llama-simple -m /home/bigkahuna/models/gguf/Ling-2.6-flash-fp8-Q8_0.gguf -n 0 -ngl 0 hello`.
+  Result: loads all 573 tensors, initializes 576 MiB MLA K cache + 56 MiB simple-GLA recurrent state, reserves BailingMoeV2.5 graph successfully (3048 nodes, 1 split), exits without decode.
+- [ ] Actual decode/logit validation remains Phase 6 (CPU full-token eval is slow; use GPU or layer-isolated tests for parity).
 
 ---
 
 ## Phase 6: Verification & testing
 
-### 6.1 Convert + smoke test ✅ (Phase 1-3 validated; Phase 5 intentionally stubbed)
+### 6.1 Convert + smoke test ✅ (Phase 1-3 validated; superseded by Phase 5 graph smoke)
 - [x] Download `inclusionAI/Ling-2.6-flash-fp8` for Phase 1-3 validation. Rationale: same `BailingMoeV2_5ForCausalLM` / `bailing_hybrid` architecture as BF16, includes the MTP layer, ~109GB source checkpoint instead of ~200GB, ungated. Converter dequantizes FP8 tensors internally, then writes GGUF (`--outtype q8_0` for this smoke test).
   - Note: `inclusionAI/Ling-2.6-flash-int4` is smaller (~65GB) but omits `model-mtp-layer.safetensors` / `model.layers.32.*`, so it cannot validate Phase 3 MTP loading despite `num_nextn_predict_layers=1` in its config.
 - [x] Run `convert_hf_to_gguf.py` on the downloaded FP8 checkpoint. Output GGUF: `/home/bigkahuna/models/gguf/Ling-2.6-flash-fp8-Q8_0.gguf` (573 tensors, ~107GB on disk / 114.3G logical tensor payload).
@@ -284,7 +281,7 @@ mtp_logits = ggml_mul_mat(model.output, x);  // SHARED lm_head
     - `group_norm_groups == 4`.
     - Slope tensors present at all 28 recurrent layers, F32, shape `[32]`.
     - MLA splits: `attn_k_b`, `attn_v_b` present for the 4 MLA layers + MTP, with corrected shapes `[128,512,32]` / `[512,128,32]`.
-- [x] Exercise C++ loader on the converted GGUF with `./build/bin/llama-simple -m ... -n 1 -ngl 0 hello`. Result: metadata + all 573 tensors load, hybrid KV/recurrent memory initializes (56 MiB RS buffer), then context creation reaches the intentional `bailingmoe2.5 graph builder is not yet implemented` runtime error.
+- [x] Exercise C++ loader on the converted GGUF with `./build/bin/llama-simple -m ... -n 1 -ngl 0 hello` before Phase 5. Result at that checkpoint: metadata + all 573 tensors loaded, hybrid KV/recurrent memory initialized (56 MiB RS buffer), then context creation reached the intentional `bailingmoe2.5 graph builder is not yet implemented` runtime error. Phase 5 now replaces this with a real main-path graph builder; see §5.9.
 
 ### 6.2 Numerical parity vs HF transformers
 - [ ] Build a side-by-side test harness:
