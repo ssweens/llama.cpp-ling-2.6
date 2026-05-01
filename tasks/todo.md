@@ -113,10 +113,10 @@ Companion document: `tasks/review-findings.md` (open decisions, prior-plan corre
 - [x] Add `attn_g_proj`, `attn_g_norm`, `attn_g_decay` tensor pointers to `struct llama_layer`.
 
 ### 3.3 `src/llama-model.cpp` ✅ (loader; graph dispatch stubbed)
-- [x] `load_hparams` case for `LLM_ARCH_BAILINGMOE2_5`: reads V2 MoE KVs + MLA dims (key_length_mla, value_length_mla, q_lora_rank, kv_lora_rank) + group_norm_groups. Populates `recurrent_layer_arr`. Type detection by n_layer (32 or 33 → LLM_TYPE_100B_A6B for Ling-2.6-flash).
+- [x] `load_hparams` case for `LLM_ARCH_BAILINGMOE2_5`: reads V2 MoE KVs + MLA dims (key_length_mla, value_length_mla, q_lora_rank, kv_lora_rank) + group_norm_groups. Populates `recurrent_layer_arr`. Sets simple-GLA recurrent state via existing SSM fields (`ssm_d_state=128`, `ssm_d_inner=4096`, so `n_embd_s=524288`; `ssm_d_conv=0`, so `n_embd_r=0`). Type detection by n_layer (32 or 33 → LLM_TYPE_100B_A6B for Ling-2.6-flash).
 - [x] `load_tensors` case dispatches per-layer on `is_mtp` and `is_recurrent`:
     - Linear-attn: attn_qkv, attn_out, attn_q_norm, attn_k_norm, attn_g_proj, attn_g_norm, attn_g_decay.
-    - MLA (and MTP): wq_a, attn_q_a_norm, wq_b, wkv_a_mqa, attn_kv_a_norm, wkv_b/wk_b/wv_b (with absorbed-fallback), wo.
+    - MLA (and MTP): wq_a, attn_q_a_norm, wq_b, wkv_a_mqa, attn_kv_a_norm, wkv_b + wk_b + wv_b (converter emits all three; graph can choose absorbed path), wo.
     - FFN: dense for first n_layer_dense_lead layers, MoE for the rest. MTP always MoE.
     - MTP: enorm, hnorm, eh_proj, layer_out_norm. tok_embd and output (lm_head) shared with main.
 - [x] Add `LLM_ARCH_BAILINGMOE2_5` to NEOX rope_type list.
@@ -203,7 +203,7 @@ if (hparams.is_recurrent(il)) {
 ```
 
 ### 5.4 Linear attention branch (`build_linear_attn`)
-- [ ] Fused QKV: `qkv = ggml_mul_mat(layer.attn_qkv, cur)`. Shape `[16384, T, B]`.
+- [ ] Fused QKV: `qkv = ggml_mul_mat(layer.attn_qkv, cur)`. Shape `[3 * n_head * head_dim = 12288, T, B]`.
   **Cast to F32** to match SGLang's numerical precision (`qkv = qkv.to(float32)`); ggml will keep it F32 through the scan.
 - [ ] Reshape & split: `q[D=128, H=32, T, B]`, `k[D=128, H=32, T, B]`, `v[D=128, H=32, T, B]` (kv_heads_for_linear == n_heads in this checkpoint; assert).
 - [ ] **QK-norm** (per-head RMSNorm over `D=128`): `q = build_norm(q, layer.attn_q_norm, NULL, LLM_NORM_RMS, il)`; same for `k` with `attn_k_norm`. Weight shape `[128]`.
@@ -271,12 +271,16 @@ mtp_logits = ggml_mul_mat(model.output, x);  // SHARED lm_head
 
 ## Phase 6: Verification & testing
 
-### 6.1 Convert + smoke test
-- [ ] Run `convert_hf_to_gguf.py` on a downloaded checkpoint. Output should list 33 layers (32 main + 1 MTP).
-- [ ] Inspect with `gguf-dump.py`:
+### 6.1 Convert + smoke test ✅ (Phase 1-3 validated; Phase 5 intentionally stubbed)
+- [x] Download `inclusionAI/Ling-2.6-flash-fp8` for Phase 1-3 validation. Rationale: same `BailingMoeV2_5ForCausalLM` / `bailing_hybrid` architecture as BF16, includes the MTP layer, ~109GB source checkpoint instead of ~200GB, ungated. Converter dequantizes FP8 tensors internally, then writes GGUF (`--outtype q8_0` for this smoke test).
+  - Note: `inclusionAI/Ling-2.6-flash-int4` is smaller (~65GB) but omits `model-mtp-layer.safetensors` / `model.layers.32.*`, so it cannot validate Phase 3 MTP loading despite `num_nextn_predict_layers=1` in its config.
+- [x] Run `convert_hf_to_gguf.py` on the downloaded FP8 checkpoint. Output GGUF: `/home/bigkahuna/models/gguf/Ling-2.6-flash-fp8-Q8_0.gguf` (573 tensors, ~107GB on disk / 114.3G logical tensor payload).
+- [x] Inspect with `tasks/validate_ling26_gguf.py`:
     - Per-layer `head_count_kv` list contains 28 zeros and 4 ones (linear:MLA = 28:4 for L=32, G=8) plus 1 trailing one for MTP.
+    - `group_norm_groups == 4`.
     - Slope tensors present at all 28 recurrent layers, F32, shape `[32]`.
-    - MLA splits: `attn_k_b`, `attn_v_b` present for the 4 MLA layers + MTP.
+    - MLA splits: `attn_k_b`, `attn_v_b` present for the 4 MLA layers + MTP, with corrected shapes `[128,512,32]` / `[512,128,32]`.
+- [x] Exercise C++ loader on the converted GGUF with `./build/bin/llama-simple -m ... -n 1 -ngl 0 hello`. Result: metadata + all 573 tensors load, hybrid KV/recurrent memory initializes (56 MiB RS buffer), then context creation reaches the intentional `bailingmoe2.5 graph builder is not yet implemented` runtime error.
 
 ### 6.2 Numerical parity vs HF transformers
 - [ ] Build a side-by-side test harness:

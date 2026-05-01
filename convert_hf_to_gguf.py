@@ -11256,11 +11256,11 @@ class BailingMoeV2Model(TextModel):
 class BailingMoeV2_5Model(BailingMoeV2Model):
     """Ling-2.6-flash and family (HF model_type 'bailing_hybrid').
 
-    Hybrid attention MoE: every layer_group_size'th layer (and any tail layers
-    after the last whole group) uses DeepSeek-V3-style MLA with q-LoRA;
-    the rest use Lightning-Attention-2 (simple_gla) with fixed per-head
-    exponential decay. Plus one MTP/nextn layer shipped in an external
-    'model-mtp-layer.safetensors' file (not referenced by the main index).
+    Hybrid attention MoE: every layer_group_size'th layer uses DeepSeek-V3-style
+    MLA with q-LoRA; the rest use Lightning-Attention-2 (simple_gla) with fixed
+    per-head exponential decay. Plus one MTP/nextn layer shipped in
+    'model-mtp-layer.safetensors'. Some repos reference it from the main index;
+    older/export variants may leave it orphaned.
     """
     model_arch = gguf.MODEL_ARCH.BAILINGMOE2_5
 
@@ -11331,15 +11331,24 @@ class BailingMoeV2_5Model(BailingMoeV2Model):
         return torch.tensor(slopes(n_attention_heads), dtype=torch.float32)
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
-        # 1) Load MTP weights from the orphan file not referenced by
-        #    model.safetensors.index.json. The base discovery logic skips it.
-        from safetensors.torch import load_file
+        # 1) MTP weights are normally referenced by model.safetensors.index.json
+        #    (confirmed for Ling-2.6-flash BF16/FP8), so they go through the
+        #    regular indexing + dequant path. Do NOT load model-mtp-layer here
+        #    in that case: FP8 sidecars (*.weight_scale_inv) would bypass
+        #    dequant_model() and fail tensor-name mapping.
+        #
+        #    If a future/export variant ships the MTP file as a true orphan, it
+        #    must be indexed before dequant_model(), not yielded here. For now we
+        #    warn so the missing MTP is explicit rather than silently raw-loaded.
         mtp_path = self.dir_model / "model-mtp-layer.safetensors"
-        if mtp_path.is_file():
-            logger.info(f"gguf: loading MTP weights from {mtp_path.name}")
-            for name, t in load_file(str(mtp_path)).items():
-                yield name, t
-        else:
+        mtp_indexed = any(name.startswith("model.layers.32.") for name in self.model_tensors)
+        if mtp_path.is_file() and not mtp_indexed:
+            logger.warning(
+                f"MTP file {mtp_path.name} exists but is not referenced by the "
+                f"main tensor index. Orphan-MTP pre-dequant indexing is not "
+                f"implemented yet; conversion will skip it."
+            )
+        elif not mtp_path.is_file():
             logger.warning(
                 f"MTP file not found at {mtp_path}; conversion will produce a "
                 f"GGUF without the MTP layer. This is expected only when "
@@ -11369,12 +11378,14 @@ class BailingMoeV2_5Model(BailingMoeV2Model):
         if name.endswith("attention.kv_b_proj.weight"):
             qk_nope = self.hparams["qk_nope_head_dim"]
             v_head = self.hparams["v_head_dim"]
-            # HF shape: [n_kv_h * (qk_nope + v_head), kv_lora_rank].
-            # We forced n_kv_h = 1 in set_gguf_parameters, so first dim is
-            # exactly (qk_nope + v_head).
-            kv_b = data_torch.view(1, qk_nope + v_head, -1)
+            n_head = self.hparams["num_attention_heads"]
+            # HF shape: [n_head * (qk_nope + v_head), kv_lora_rank].
+            # Note: set_gguf_parameters forces num_key_value_heads=1 for the
+            # MLA KV cache metadata, but kv_b_proj itself is still per-query-head.
+            assert data_torch.shape[0] == n_head * (qk_nope + v_head)
+            kv_b = data_torch.view(n_head, qk_nope + v_head, -1)
             k_b, v_b = torch.split(kv_b, [qk_nope, v_head], dim=1)
-            k_b = k_b.transpose(1, 2)  # [1, kv_lora_rank, qk_nope] for absorption
+            k_b = k_b.transpose(1, 2)  # [n_head, kv_lora_rank, qk_nope] for absorption
             yield from super().modify_tensors(data_torch, name, bid)
             yield from super().modify_tensors(
                 k_b, name.replace("kv_b_proj", "k_b_proj"), bid)

@@ -2556,6 +2556,12 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     hparams.recurrent_layer_arr[i] = (hparams.n_head_kv(i) == 0);
                 }
 
+                // Recurrent simple-GLA state shape is [n_head, head_dim_k, head_dim_v],
+                // flattened for llama_memory_recurrent as n_embd_s() = ssm_d_state * ssm_d_inner.
+                // No conv/R-state is used because ssm_d_conv remains 0.
+                hparams.ssm_d_state = hparams.n_embd_head_k();
+                hparams.ssm_d_inner = hparams.n_head() * hparams.n_embd_head_v();
+
                 switch (hparams.n_layer) {
                     // Ling-2.6-flash: 32 transformer + 1 MTP = 33 total
                     // Total params: 104B; active: 7.4B
@@ -6744,10 +6750,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         if (is_linear_attn) {
                             // ===== Linear attention (Lightning-Attention-2 / simple_gla) =====
-                            // Fused QKV: hidden -> (n_head + 2*n_kv) * head_dim. For Ling-2.6-flash
-                            // n_kv == n_head, so total output is 4 * n_head * head_dim. We compute
-                            // it via n_embd + 2*n_embd_gqa to follow the BAILINGMOE2 pattern.
-                            layer.wqkv         = create_tensor(tn(LLM_TENSOR_ATTN_QKV,    "weight", i), {n_embd, n_embd + 2*n_embd_gqa}, 0);
+                            // Fused QKV: hidden -> 3 * n_head * head_dim. Linear-attn layers are
+                            // full-head (n_kv == n_head), even though head_count_kv is encoded as 0
+                            // to mark the layer recurrent. Do not use n_embd_gqa here: for recurrent
+                            // layers it is intentionally 0.
+                            layer.wqkv         = create_tensor(tn(LLM_TENSOR_ATTN_QKV,    "weight", i), {n_embd, 3 * la_head_dim * n_head}, 0);
                             layer.wo           = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", i), {la_head_dim * n_head, n_embd}, 0);
                             layer.attn_q_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {la_head_dim}, 0);
                             layer.attn_k_norm  = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {la_head_dim}, 0);
@@ -6767,15 +6774,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.wkv_a_mqa     = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA,   "weight", i), {n_embd, kv_lora_rank + qk_rope_head_dim}, 0);
                             layer.attn_kv_a_norm= create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM,  "weight", i), {kv_lora_rank}, 0);
 
-                            // Try non-absorbed (legacy) first; if absent the loader will fall through
-                            // to the absorbed (k_b/v_b) form. Matches kimi-linear's pattern.
+                            // Converter emits both the original non-absorbed kv_b and the split
+                            // absorbed k_b/v_b tensors. Load all three so GGUF tensor accounting is
+                            // exact; the graph builder can choose the absorbed path later.
                             layer.wkv_b = create_tensor(tn(LLM_TENSOR_ATTN_KV_B, "weight", i),
                                 {kv_lora_rank, n_head * (qk_nope_head_dim + n_embd_head_v_mla)},
                                 TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
-                            if (!layer.wkv_b) {
-                                layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K_B, "weight", i), {qk_nope_head_dim, kv_lora_rank, n_head}, 0);
-                                layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {kv_lora_rank, n_embd_head_v_mla, n_head}, 0);
-                            }
+                            layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K_B, "weight", i), {qk_nope_head_dim, kv_lora_rank, n_head}, 0);
+                            layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {kv_lora_rank, n_embd_head_v_mla, n_head}, 0);
                             layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v_mla, n_embd}, 0);
                         }
 
