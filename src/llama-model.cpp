@@ -744,6 +744,14 @@ void llama_model::load_hparams(llama_model_loader & ml) {
         }
     }
 
+    if (arch == LLM_ARCH_BAILINGMOE2_5 && hparams.n_expert > 0 && hparams.n_expert_groups == 0) {
+        // Older BailingMoeV2.5 GGUFs produced before Phase 6 validation omitted
+        // the HF config-class defaults for group-limited MoE routing. Ling-2.6-flash
+        // uses n_group=8 and topk_group=4 (top-2 scores per group, then top-4 groups).
+        hparams.n_expert_groups = 8;
+        hparams.n_group_used    = 4;
+    }
+
     if (arch == LLM_ARCH_WAVTOKENIZER_DEC) {
         ml.get_key(LLM_KV_FEATURES_LENGTH,  hparams.n_embd);
         ml.get_key(LLM_KV_EMBEDDING_LENGTH, hparams.n_embd_out_impl);

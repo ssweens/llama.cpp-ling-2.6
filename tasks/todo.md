@@ -291,6 +291,8 @@ mtp_logits = ggml_mul_mat(model.output, x);  // SHARED lm_head
 - [ ] Compare:
     - Logits at positions {0, 1, 64, 128, 255}: rtol=1e-3, atol=1e-4.
     - Top-1 token argmax must match in 100% of compared positions.
+- [ ] CPU-only status (2026-04-30): full HF-vs-llama parity is not practical on this host without a smaller layer-isolated harness; the available checkpoint + Q8 GGUF already consume ~200GB on disk and full-model HF F32/BF16 CPU load would exceed the intended validation budget.
+- [ ] CPU runtime sanity found the graph executes without crashes, but greedy 64-token output from the Q8_0 GGUF is degenerate (`0000...`). Treat this as a parity/quality blocker until layer-isolated comparisons identify whether the issue is linear-attn math, MLA RoPE/absorbed KV, MoE routing, or FP8->Q8 conversion quality.
 - [ ] If parity fails, bisect by:
     1. Embeddings only (truncate to 1 layer): verify token embedding identity.
     2. One linear-attn layer end-to-end (force layer 0): isolates `simple_gla_scan` + GroupRMSNorm + RoPE-NeoX correctness.
@@ -298,10 +300,14 @@ mtp_logits = ggml_mul_mat(model.output, x);  // SHARED lm_head
     4. Full main stack: isolates layer-pattern bookkeeping.
     5. Add MTP: isolates MTP graph.
 
-### 6.3 Runtime tests
-- [ ] `llama-cli` 64-token completion at FP16 for sanity.
-- [ ] `llama-bench` quick run for tok/s sanity (compare vs Kimi-Linear of similar size as ballpark).
-- [ ] `tests/test-chat-template` (Jinja mode) to verify chat-template parity.
+### 6.3 Runtime tests (CPU-only pass)
+- [x] `llama-simple` one-token decode, Q8_0, `-ngl 0`: graph executes and decodes 1 token without runtime errors. Logs:
+    - `tasks/logs/ling26_phase6_cpu_decode_n1.log`
+    - `tasks/logs/ling26_phase6_cpu_decode_n1_after_moe_defaults.log`
+- [x] 64-token CPU-only completion at Q8_0 (substituted for FP16 because disk is too tight for an FP16/BF16 GGUF): completed without runtime errors, but output was degenerate zeros; keep as a Phase 6 quality blocker. Log: `tasks/logs/ling26_phase6_cpu_completion64.log`.
+- [x] `llama-bench` quick CPU-only microbench (`-ngl 0 -p 1 -n 1 -r 1 -b 1 -ub 1 -t 16 -fa 0`): `pp1 0.74 t/s`, `tg1 1.37 t/s`. Log: `tasks/logs/ling26_phase6_cpu_bench_p1n1.log`.
+- [x] `tests/test-chat-template` passed via `ctest --test-dir build -R test-chat-template --output-on-failure`.
+- [ ] `llama-cli` 64-token completion at FP16 remains not run in this CPU-only pass: this build has `LLAMA_BUILD_SERVER=OFF`, so the `llama-cli` target is not available, and the current disk budget cannot hold an FP16/BF16 GGUF for Ling-2.6-flash.
 
 ### 6.4 Quantization
 - [ ] **Pin F32**: all `*_norm.weight` tensors (`attn_norm`, `ffn_norm`, `attn_q_norm`, `attn_k_norm`, `attn_g_norm`, `attn_q_a_norm`, `attn_kv_a_norm`, `enorm`, `hnorm`, `final_layernorm`, `output_norm`), `attn_g_decay`, `ffn_gate_inp` (router), `ffn_exp_probs_b` (expert bias).

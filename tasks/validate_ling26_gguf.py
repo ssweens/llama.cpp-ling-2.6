@@ -40,6 +40,8 @@ def main() -> int:
     head_kv = field(reader, f"{ARCH}.attention.head_count_kv")
     group_norm_groups = field(reader, f"{ARCH}.attention.group_norm_groups")
     nextn = field(reader, f"{ARCH}.nextn_predict_layers")
+    expert_group_field = reader.get_field(f"{ARCH}.expert_group_count")
+    expert_group_used_field = reader.get_field(f"{ARCH}.expert_group_used_count")
 
     assert n_layer == 33, f"expected 33 layers (32 main + 1 MTP), got {n_layer}"
     assert nextn == 1, f"expected nextn_predict_layers=1, got {nextn}"
@@ -48,6 +50,16 @@ def main() -> int:
     assert [i for i, v in enumerate(head_kv[:32]) if v == 1] == [7, 15, 23, 31], head_kv
     assert head_kv[32] == 1, f"expected MTP layer head_count_kv=1, got {head_kv[32]}"
     assert group_norm_groups == 4, f"expected group_norm_groups=4, got {group_norm_groups}"
+    if expert_group_field is not None:
+        expert_groups = expert_group_field.contents()
+        assert expert_groups == 8, f"expected expert_group_count=8, got {expert_groups}"
+    else:
+        expert_groups = None
+    if expert_group_used_field is not None:
+        expert_groups_used = expert_group_used_field.contents()
+        assert expert_groups_used == 4, f"expected expert_group_used_count=4, got {expert_groups_used}"
+    else:
+        expert_groups_used = None
 
     recurrent_layers = [i for i, v in enumerate(head_kv[:32]) if v == 0]
     mla_layers = [i for i, v in enumerate(head_kv) if v == 1]
@@ -79,6 +91,10 @@ def main() -> int:
     print(f"  recurrent layers: {recurrent_layers}")
     print(f"  MLA/MTP layers: {mla_layers}")
     print(f"  group_norm_groups: {group_norm_groups}")
+    if expert_groups is None or expert_groups_used is None:
+        print("  expert groups: missing in GGUF (loader fallback uses 8 groups / 4 used)")
+    else:
+        print(f"  expert groups: {expert_groups}, used: {expert_groups_used}")
     return 0
 
 

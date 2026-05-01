@@ -11269,9 +11269,15 @@ class BailingMoeV2_5Model(BailingMoeV2Model):
         # base writes head_count_kv=1; we overwrite with the per-layer hybrid
         # mask below.
         self.hparams["num_key_value_heads"] = 1
-        # V2.5 config omits norm_topk_prob; the HF Gate.forward divides scores
-        # by sum, equivalent to norm_topk_prob=True.
+        # V2.5 config omits norm_topk_prob in some repos; the HF Gate.forward
+        # divides scores by sum, equivalent to norm_topk_prob=True.
         self.hparams.setdefault("norm_topk_prob", True)
+        # Ling/BailingMoeV2.5 uses DeepSeek-style group-limited expert routing.
+        # Some HF configs omit n_group/topk_group because the config class supplies
+        # defaults (8/4), so populate those before the generic GGUF writer emits
+        # expert_group_count and expert_group_used_count.
+        self.hparams.setdefault("n_group", 8)
+        self.hparams.setdefault("topk_group", 4)
 
         super().set_gguf_parameters()
 
