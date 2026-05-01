@@ -25,36 +25,21 @@ Companion document: `tasks/review-findings.md` (open decisions, prior-plan corre
 
 ## Phase 1: GGUF schema & tensor mapping
 
-### 1.1 `gguf-py/gguf/constants.py`
-- [ ] Add `MODEL_ARCH.BAILINGMOE2_5 = auto()` and `"bailingmoe2.5"` mapping.
-- [ ] Add new `MODEL_TENSOR` entries:
-    - `ATTN_G_PROJ` (linear-attn output sigmoid gate)
-    - `ATTN_G_NORM` (linear-attn GroupRMSNorm)
-    - `ATTN_G_DECAY` (linear-attn precomputed per-head log-decay)
-- [ ] Define the `MODEL_ARCH.BAILINGMOE2_5` tensor list. Include both attention conventions (linear-attn + MLA) plus MTP-only tensors:
-    - Embeddings: `TOKEN_EMBD`, `OUTPUT_NORM`, `OUTPUT`
-    - Per-layer: `ATTN_NORM`, `FFN_NORM`
-    - Linear-attn (per-recurrent-layer): `ATTN_QKV`, `ATTN_OUT`, `ATTN_Q_NORM`, `ATTN_K_NORM`, `ATTN_G_PROJ`, `ATTN_G_NORM`, `ATTN_G_DECAY`
-    - MLA (per-attention-layer): `ATTN_Q_A`, `ATTN_Q_A_NORM`, `ATTN_Q_B`, `ATTN_KV_A_MQA`, `ATTN_KV_A_NORM`, `ATTN_KV_B`, `ATTN_K_B`, `ATTN_V_B`, `ATTN_OUT`
-    - MoE block: `FFN_GATE_INP`, `FFN_EXP_PROBS_B`, `FFN_GATE_EXPS`, `FFN_DOWN_EXPS`, `FFN_UP_EXPS`, `FFN_GATE_SHEXP`, `FFN_DOWN_SHEXP`, `FFN_UP_SHEXP`
-    - Dense FFN (first `first_k_dense_replace` layers only): `FFN_GATE`, `FFN_DOWN`, `FFN_UP`
-    - MTP-only (layer index 32): `FFN_SUB_NORM` (alias for `enorm`), `ATTN_SUB_NORM` (alias for `hnorm`), `EH_PROJ`, MTP `OUTPUT_NORM` (`final_layernorm`)
+### 1.1 `gguf-py/gguf/constants.py` ✅
+- [x] Add `MODEL_ARCH.BAILINGMOE2_5 = auto()` and `"bailingmoe2.5"` mapping.
+- [x] Add new `MODEL_TENSOR` entries: `ATTN_G_PROJ`, `ATTN_G_NORM`, `ATTN_G_DECAY`.
+- [x] Define `MODEL_ARCH.BAILINGMOE2_5` tensor list (35 entries).
+  Notes from implementation:
+  - Reused existing `NEXTN_EH_PROJ`, `NEXTN_ENORM`, `NEXTN_HNORM` for MTP block.
+  - Mapped MTP `final_layernorm` to existing `LAYER_OUT_NORM` (matches bailingmoe2's mapping of the same source name).
+  - `NEXTN_EMBED_TOKENS`, `NEXTN_SHARED_HEAD_HEAD`, `NEXTN_SHARED_HEAD_NORM` deliberately omitted — V2.5 MTP shares `tok_embd` and `lm_head` with main model (verified against `model-mtp-layer.safetensors` index).
+  - Single `ATTN_OUT`, `ATTN_NORM`, `FFN_NORM` covers both attention types (HF uses identical names across linear-attn and MLA layers).
 
-### 1.2 `gguf-py/gguf/tensor_mapping.py`
-- [ ] Add HF→GGUF mappings for the new tensors. Reuse existing entries where possible:
-    - `model.layers.{bid}.attention.query_key_value` → `ATTN_QKV` (already exists for `bailingmoe2`)
-    - `model.layers.{bid}.attention.dense` → `ATTN_OUT` (already exists)
-    - `model.layers.{bid}.attention.query_layernorm` → `ATTN_Q_NORM` (already exists)
-    - `model.layers.{bid}.attention.key_layernorm` → `ATTN_K_NORM` (already exists)
-    - `model.layers.{bid}.attention.g_proj` → `ATTN_G_PROJ` (NEW)
-    - `model.layers.{bid}.attention.g_norm` → `ATTN_G_NORM` (NEW)
-    - `model.layers.{bid}.attention.q_a_proj` → `ATTN_Q_A` (already exists for deepseek2)
-    - `model.layers.{bid}.attention.q_a_layernorm` → `ATTN_Q_A_NORM` (already exists)
-    - `model.layers.{bid}.attention.q_b_proj` → `ATTN_Q_B` (already exists)
-    - `model.layers.{bid}.attention.kv_a_proj_with_mqa` → `ATTN_KV_A_MQA` (already exists)
-    - `model.layers.{bid}.attention.kv_a_layernorm` → `ATTN_KV_A_NORM` (already exists)
-    - `model.layers.{bid}.attention.kv_b_proj` → `ATTN_KV_B` (already exists; will be split — see 2.3)
-    - MTP block: `enorm`, `hnorm`, `eh_proj`, `final_layernorm`
+### 1.2 `gguf-py/gguf/tensor_mapping.py` ✅
+- [x] Added 3 new tensor mappings: `ATTN_G_PROJ`, `ATTN_G_NORM`, `ATTN_G_DECAY`.
+- [x] Extended existing MLA mappings (`ATTN_Q_A`, `ATTN_Q_B`, `ATTN_KV_A_MQA`, `ATTN_KV_B`, `ATTN_K_B`, `ATTN_V_B`, `ATTN_Q_A_NORM`, `ATTN_KV_A_NORM`) with bailingmoe2.5 source names (`model.layers.{bid}.attention.*` instead of deepseek2's `self_attn.*`).
+- [x] Smoke test (28/28 sample HF tensor names map correctly across linear-attn + MLA + MTP layers + common tensors).
+- [x] `pytest gguf-py/tests/` passes (5/5).
 
 ### 1.3 `gguf-py/gguf/gguf_writer.py` and constants
 - [ ] Add new KVs (or confirm existing reused):

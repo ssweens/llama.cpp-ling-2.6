@@ -1064,40 +1064,60 @@ class TensorNameMap:
         MODEL_TENSOR.ATTN_Q_A: (
             "model.layers.{bid}.self_attn.q_a_proj", # deepseek2
             "layers.{bid}.attention.wq_a",           # mistral-large
+            "model.layers.{bid}.attention.q_a_proj", # bailingmoe2.5
         ),
 
         MODEL_TENSOR.ATTN_Q_B: (
             "model.layers.{bid}.self_attn.q_b_proj", # deepseek2
             "layers.{bid}.attention.wq_b",           # mistral-large
+            "model.layers.{bid}.attention.q_b_proj", # bailingmoe2.5
         ),
 
         MODEL_TENSOR.ATTN_KV_A_MQA: (
             "model.layers.{bid}.self_attn.kv_a_proj_with_mqa", # deepseek2
             "layers.{bid}.attention.wkv_a_with_mqa",           # mistral-large
+            "model.layers.{bid}.attention.kv_a_proj_with_mqa", # bailingmoe2.5
         ),
 
         MODEL_TENSOR.ATTN_KV_B: (
             "model.layers.{bid}.self_attn.kv_b_proj", # deepseek2
+            "model.layers.{bid}.attention.kv_b_proj", # bailingmoe2.5
         ),
 
         MODEL_TENSOR.ATTN_K_B: (
             "model.layers.{bid}.self_attn.k_b_proj",  # deepseek2
             "layers.{bid}.attention.k_b_proj",        # mistral-large
+            "model.layers.{bid}.attention.k_b_proj",  # bailingmoe2.5 (synthesized at convert)
         ),
 
         MODEL_TENSOR.ATTN_V_B: (
             "model.layers.{bid}.self_attn.v_b_proj",  # deepseek2
             "layers.{bid}.attention.v_b_proj",        # mistral-large
+            "model.layers.{bid}.attention.v_b_proj",  # bailingmoe2.5 (synthesized at convert)
         ),
 
         MODEL_TENSOR.ATTN_Q_A_NORM: (
             "model.layers.{bid}.self_attn.q_a_layernorm", # deepseek2
             "layers.{bid}.attention.q_a_norm",            # mistral-large
+            "model.layers.{bid}.attention.q_a_layernorm", # bailingmoe2.5
         ),
 
         MODEL_TENSOR.ATTN_KV_A_NORM: (
             "model.layers.{bid}.self_attn.kv_a_layernorm", # deepseek2
             "layers.{bid}.attention.kv_a_norm",            # mistral-large
+            "model.layers.{bid}.attention.kv_a_layernorm", # bailingmoe2.5
+        ),
+
+        MODEL_TENSOR.ATTN_G_PROJ: (
+            "model.layers.{bid}.attention.g_proj",        # bailingmoe2.5
+        ),
+
+        MODEL_TENSOR.ATTN_G_NORM: (
+            "model.layers.{bid}.attention.g_norm",        # bailingmoe2.5
+        ),
+
+        MODEL_TENSOR.ATTN_G_DECAY: (
+            "model.layers.{bid}.attention.g_decay",       # bailingmoe2.5 (synthesized at convert)
         ),
 
         MODEL_TENSOR.ATTN_SUB_NORM: (
