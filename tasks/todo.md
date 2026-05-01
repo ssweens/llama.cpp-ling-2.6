@@ -169,14 +169,16 @@ Initial `S` taken from the input `state` tensor. Final `S` is returned in the pa
 - [x] Follow `ggml_gated_delta_net` sharding pattern: parallel chunks over `(B, H)` pairs.
 - [x] F32 accumulation and F32 state/output storage. V1 API accepts F32 inputs; Phase 5 graph casts QKV to F32 before calling the op.
 
-### 4.5 GPU kernels (defer to follow-up PR if needed)
-- [ ] CUDA: model after `ggml/src/ggml-cuda/kda.cu` or `wkv6.cu`. Tile per `(B, H)`, register-tile the state.
+### 4.5 GPU kernels
+- [x] CUDA F32 reference/perf kernel for `D_k == D_v ∈ {64, 128}` with one CUDA block per `(B, H)` pair. It keeps the `[D_k, D_v]` state row for one value channel in registers and writes the packed output/new-state layout expected by the CPU op. Verified the state layout is `[D_k, D_v, H, B]`; an early transposed load/store failed backend-op parity and was corrected before committing.
+- [ ] CUDA follow-up optimization: tune register pressure / occupancy and add a chunked prefill path for larger `T` if profiling shows `simple_gla_scan` remains material.
 - [ ] Metal: similar.
 - [ ] Vulkan/SYCL: lower priority.
 
 ### 4.6 Tests ✅
 - [x] Add a dedicated CPU reference test (`tests/test-simple-gla.cpp`) that compares packed op output + final state against a direct C++ reference for deterministic inputs at `T ∈ {1, 4, 8}` and `B ∈ {1, 2}`.
 - [x] Add `tests/test-backend-ops.cpp` coverage so backend support/perf harness can see `GGML_OP_SIMPLE_GLA_SCAN`.
+- [x] Add CUDA-sized backend-op cases (`D=64`, `D=128`) so CUDA support is actually exercised; `./build/bin/test-backend-ops -o SIMPLE_GLA_SCAN` passes on CUDA0/CUDA1/CUDA2.
 - [x] Numerical tolerance: rtol=1e-4, atol=1e-5 in F32.
 
 ---
@@ -335,7 +337,15 @@ mtp_logits = ggml_mul_mat(model.output, x);  // SHARED lm_head
 - [x] CPU Q8_0 coherent-output validation after the QKV-stride fix: `CUDA_VISIBLE_DEVICES= ./build/bin/llama-completion -m ...Q8_0.gguf -ngl 0 -fa auto -n 32 -p "Write one short sentence about llamas." --temp 0 --top-k 1 -st --jinja --no-warmup` produced `Llamas are gentle, social herd animals known for their distinctive banana-shaped ears and soft, woolly coats.` Log: `tasks/logs/ling26_qkv_stride_fix_q8_cpu_chat_sentence.log`.
 - [ ] Run perplexity on wiki.test.raw at Q4_K_M; flag if >5% degradation vs F16.
 
-### 6.5 Documentation
+### 6.5 CUDA performance pass
+- [x] Root bottleneck identified: `GGML_OP_SIMPLE_GLA_SCAN` was CPU-only, forcing GPU↔CPU splits in every recurrent layer. Baseline coherent Q2_K 2x5090 full-offload run had `CUDA_Host compute buffer size = 3954.04 MiB`, `graph splits = 61`, and decode `25.00 tok/s` (`40.00 ms/token`). Log: `tasks/logs/ling26_qkv_stride_fix_q2k_long_pack_animals.log`.
+- [x] Added CUDA support for `ggml_simple_gla_scan`. Corrected CUDA state load/store after backend-op parity exposed a transposed `[D_k, D_v]` layout bug.
+- [x] Correct CUDA run on Q2_K 2x5090 full offload with `-c 4096`: `CUDA_Host compute buffer size = 48.04 MiB`, `graph splits = 46`, coherent output, decode `34.32 tok/s` (`29.13 ms/token`). Log: `tasks/logs/ling26_simple_gla_cuda_correct_q2k_long_ctx4096.log`.
+- [x] `llama-bench` after CUDA simple-GLA: `pp64 641.10 ± 15.19 t/s`, `tg128 34.24 ± 0.02 t/s` on 2x RTX 5090, Q2_K full offload. Log: `tasks/logs/ling26_simple_gla_cuda_vec_q2k_bench_p64n128.log`.
+- [x] Placement experiments: 3-GPU layer split was slower (~24.5 tok/s because the 3090 adds pipeline latency); 2-GPU row split was slower (~23.4 tok/s); tensor split is not implemented for `bailingmoe2.5`; `--no-host` and `-mg 1` did not improve decode.
+- [ ] Further speed work: single-stream decode remains MoE/matmul-launch bound at batch=1; likely follow-ups are MTP/NEXTN speculative decoding and/or deeper MoE kernel/fusion work, not more CPU fallback removal.
+
+### 6.6 Documentation
 - [ ] Add Ling-2.6-flash to `README.md` supported-models table.
 - [ ] Add a short note in `docs/development/HOWTO-add-model.md` (or wherever Kimi-Linear's notes live) explaining the slope-baking convention, in case future Lightning-Attention models reuse the op.
 

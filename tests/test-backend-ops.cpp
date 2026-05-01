@@ -8832,6 +8832,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_simple_gla_scan(4, 16, 16, 1, 1));
     test_cases.emplace_back(new test_simple_gla_scan(4, 16, 16, 8, 1));
     test_cases.emplace_back(new test_simple_gla_scan(2, 8, 4, 4, 2));
+    test_cases.emplace_back(new test_simple_gla_scan(4, 64, 64, 1, 1));
+    test_cases.emplace_back(new test_simple_gla_scan(4, 128, 128, 1, 1));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
