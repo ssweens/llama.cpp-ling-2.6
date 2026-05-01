@@ -11252,6 +11252,133 @@ class BailingMoeV2Model(TextModel):
                 raise ValueError(f"Unprocessed experts: {experts}")
 
 
+@ModelBase.register("BailingMoeV2_5ForCausalLM")
+class BailingMoeV2_5Model(BailingMoeV2Model):
+    """Ling-2.6-flash and family (HF model_type 'bailing_hybrid').
+
+    Hybrid attention MoE: every layer_group_size'th layer (and any tail layers
+    after the last whole group) uses DeepSeek-V3-style MLA with q-LoRA;
+    the rest use Lightning-Attention-2 (simple_gla) with fixed per-head
+    exponential decay. Plus one MTP/nextn layer shipped in an external
+    'model-mtp-layer.safetensors' file (not referenced by the main index).
+    """
+    model_arch = gguf.MODEL_ARCH.BAILINGMOE2_5
+
+    def set_gguf_parameters(self):
+        # MLA cache requires GQA-1 (MQA). Force this BEFORE super so the V2
+        # base writes head_count_kv=1; we overwrite with the per-layer hybrid
+        # mask below.
+        self.hparams["num_key_value_heads"] = 1
+        # V2.5 config omits norm_topk_prob; the HF Gate.forward divides scores
+        # by sum, equivalent to norm_topk_prob=True.
+        self.hparams.setdefault("norm_topk_prob", True)
+
+        super().set_gguf_parameters()
+
+        hparams = self.hparams
+        L = hparams["num_hidden_layers"]
+        G = hparams["layer_group_size"]
+        n_head = hparams["num_attention_heads"]
+        head_dim = hparams.get("head_dim") or hparams["hidden_size"] // n_head
+        nextn = hparams.get("num_nextn_predict_layers", 0)
+
+        # Per-layer attention-type encoding (matches kimi-linear convention):
+        #   0 = recurrent (linear-attn / Lightning-Attention-2)
+        #   1 = MLA (compressed to MQA via kv_b_proj split, see modify_tensors)
+        head_kv_list: list[int] = []
+        for il in range(L):
+            is_mla = ((il + 1) % G == 0) or (il >= (L // G) * G)
+            head_kv_list.append(1 if is_mla else 0)
+        # MTP layers always use MLA (HF hardcodes it in BailingMoeV2_5MTPLayer)
+        head_kv_list.extend([1] * nextn)
+        self.gguf_writer.add_head_count_kv(head_kv_list)
+
+        # MLA dimensions (DeepSeek-V3 style with q-LoRA)
+        self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
+        self.gguf_writer.add_kv_lora_rank(hparams["kv_lora_rank"])
+        self.gguf_writer.add_key_length_mla(hparams["qk_nope_head_dim"] + hparams["qk_rope_head_dim"])
+        self.gguf_writer.add_value_length_mla(hparams["v_head_dim"])
+
+        # Linear-attn output GroupRMSNorm: 'group_norm_size' channels per group
+        # → n_groups = (n_head * head_dim) / group_norm_size. For Ling-2.6-flash:
+        # 4096 / 4 = 1024 groups.
+        gns = hparams["group_norm_size"]
+        self.gguf_writer.add_group_norm_groups((n_head * head_dim) // gns)
+
+    @staticmethod
+    def _build_slopes(n_attention_heads: int) -> Tensor:
+        """Lightning-Attention-2 base slopes; bit-exact replica of HF
+        BailingMoeV2_5LinearAttention.build_slope_tensor."""
+        import math
+
+        def slopes_pow2(n: int) -> list[float]:
+            start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+            return [start ** (i + 1) for i in range(n)]
+
+        def slopes(n: int) -> list[float]:
+            if math.log2(n).is_integer():
+                return slopes_pow2(n)
+            cl = 2 ** math.floor(math.log2(n))
+            return slopes_pow2(cl) + slopes(2 * cl)[0::2][: n - cl]
+
+        return torch.tensor(slopes(n_attention_heads), dtype=torch.float32)
+
+    def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
+        # 1) Load MTP weights from the orphan file not referenced by
+        #    model.safetensors.index.json. The base discovery logic skips it.
+        from safetensors.torch import load_file
+        mtp_path = self.dir_model / "model-mtp-layer.safetensors"
+        if mtp_path.is_file():
+            logger.info(f"gguf: loading MTP weights from {mtp_path.name}")
+            for name, t in load_file(str(mtp_path)).items():
+                yield name, t
+        else:
+            logger.warning(
+                f"MTP file not found at {mtp_path}; conversion will produce a "
+                f"GGUF without the MTP layer. This is expected only when "
+                f"converting a variant that ships without MTP weights."
+            )
+
+        # 2) Synthesize per-layer per-head fixed log-decay for linear-attn
+        #    layers. Bit-exact replica of HF formula:
+        #        slope[h] = -base_slopes[h] * (1 - (il - 1)/(L - 1) + 1e-5)
+        #    Note the (il - 1) offset: at il=0 this gives a multiplier > 1.
+        #    That matches the production HF code; do NOT "fix" the off-by-one.
+        L = self.hparams["num_hidden_layers"]
+        G = self.hparams["layer_group_size"]
+        n_head = self.hparams["num_attention_heads"]
+        base = self._build_slopes(n_head)
+        for il in range(L):
+            is_mla = ((il + 1) % G == 0) or (il >= (L // G) * G)
+            if is_mla:
+                continue
+            scale = 1.0 - (il - 1) / (L - 1) + 1e-5
+            g = -base * scale
+            yield f"model.layers.{il}.attention.g_decay.weight", g
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Absorbed-MLA path needs k_b_proj (transposed) and v_b_proj split out
+        # of kv_b_proj. We yield all three so the C++ loader can use either
+        # the absorbed (k_b/v_b) or the non-absorbed (kv_b) MLA path.
+        if name.endswith("attention.kv_b_proj.weight"):
+            qk_nope = self.hparams["qk_nope_head_dim"]
+            v_head = self.hparams["v_head_dim"]
+            # HF shape: [n_kv_h * (qk_nope + v_head), kv_lora_rank].
+            # We forced n_kv_h = 1 in set_gguf_parameters, so first dim is
+            # exactly (qk_nope + v_head).
+            kv_b = data_torch.view(1, qk_nope + v_head, -1)
+            k_b, v_b = torch.split(kv_b, [qk_nope, v_head], dim=1)
+            k_b = k_b.transpose(1, 2)  # [1, kv_lora_rank, qk_nope] for absorption
+            yield from super().modify_tensors(data_torch, name, bid)
+            yield from super().modify_tensors(
+                k_b, name.replace("kv_b_proj", "k_b_proj"), bid)
+            yield from super().modify_tensors(
+                v_b, name.replace("kv_b_proj", "v_b_proj"), bid)
+            return
+
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 @ModelBase.register("GroveMoeForCausalLM", "modeling_grove_moe.GroveMoeForCausalLM")
 class GroveMoeModel(TextModel):
     model_arch = gguf.MODEL_ARCH.GROVEMOE

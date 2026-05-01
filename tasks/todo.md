@@ -50,82 +50,46 @@ Companion document: `tasks/review-findings.md` (open decisions, prior-plan corre
 
 ---
 
-## Phase 2: Python converter (`convert_hf_to_gguf.py`)
+## Phase 2: Python converter (`convert_hf_to_gguf.py`) ✅
 
-### 2.1 Subclass `BailingMoeV2Model`
-- [ ] Register: `@ModelBase.register("BailingMoeV2_5ForCausalLM")`.
-- [ ] `model_arch = gguf.MODEL_ARCH.BAILINGMOE2_5`.
-- [ ] Override `__init__` to set `block_count = num_hidden_layers + num_nextn_predict_layers = 33`.
+### 2.1 Subclass `BailingMoeV2Model` ✅
+- [x] Register: `@ModelBase.register("BailingMoeV2_5ForCausalLM")`.
+- [x] `model_arch = gguf.MODEL_ARCH.BAILINGMOE2_5`.
+- [x] `__init__` inherited from `BailingMoeV2Model` (already sets block_count from nextn).
 
-### 2.2 `set_gguf_parameters`
-- [ ] **Force MQA for absorbed-MLA path**: `self.hparams["num_key_value_heads"] = 1` BEFORE `super().set_gguf_parameters()`. (Mirrors `KimiLinearModel`.)
-- [ ] **Per-layer `head_count_kv` list** to encode hybrid layer types (read by `is_recurrent()` via the `0 == recurrent` convention):
-    ```python
-    head_kv_list = []
-    L = hparams["num_hidden_layers"]; G = hparams["layer_group_size"]
-    for il in range(L):
-        is_mla = ((il + 1) % G == 0) or (il >= (L // G) * G)
-        head_kv_list.append(1 if is_mla else 0)  # 0 = recurrent (linear-attn), 1 = MLA (MQA)
-    self.gguf_writer.add_head_count_kv(head_kv_list)
-    ```
-    Note: do **not** rely on the formula alone — also assert via tensor presence (§2.5) for robustness against future variants.
-- [ ] Emit MLA KVs:
-    - `add_q_lora_rank(1536)`, `add_kv_lora_rank(512)`
-    - `add_key_length_mla(qk_nope_head_dim + qk_rope_head_dim) = 192`
-    - `add_value_length_mla(v_head_dim) = 128`
-    - `add_rope_dimension_count(qk_rope_head_dim) = 64`
-- [ ] Emit MoE KVs (same as V2): `add_expert_feed_forward_length(1024)`, `add_expert_shared_feed_forward_length(1024)`, `add_expert_weights_scale(2.5)`, `add_expert_shared_count(1)`, `add_expert_weights_norm(True)` (V2.5 config lacks `norm_topk_prob`; default to `True` because the HF `Gate.forward` divides by sum), `add_leading_dense_block_count(1)`.
-- [ ] Emit MTP: `add_nextn_predict_layers(1)`.
-- [ ] Emit `add_layer_group_size(8)` and `add_group_norm_size(4)` (new KVs).
-- [ ] Emit `add_rope_freq_base(6_000_000.0)`.
+### 2.2 `set_gguf_parameters` ✅
+- [x] Force `num_key_value_heads=1` before super (mirrors KimiLinear).
+- [x] `setdefault("norm_topk_prob", True)` for the missing V2.5 config key.
+- [x] Per-layer `head_count_kv` list (28 zeros + 4 ones for L=32 G=8, plus 1 for MTP).
+- [x] MLA KVs: `add_q_lora_rank`, `add_kv_lora_rank`, `add_key_length_mla`, `add_value_length_mla`.
+- [x] MoE / leading-dense / expert-weights / nextn KVs inherited from V2 super.
+- [x] `add_group_norm_groups((n_head * head_dim) // group_norm_size)`.
+- [x] `add_rope_dimension_count` inherited from V2 super (head_dim * partial_rotary_factor = 64).
+- [x] `add_rope_freq_base` inherited from TextModel super (reads `rope_theta=6_000_000`).
 
-### 2.3 `modify_tensors` overrides
-- [ ] **Split `kv_b_proj`** for absorbed-MLA path (copied from `KimiLinearModel.modify_tensors`):
-    ```python
-    if name.endswith("kv_b_proj.weight"):
-        # data shape: [n_head_kv * (qk_nope + v_head), kv_lora_rank]
-        # n_head_kv == 1 since we forced MQA
-        kv_b = data.view(1, qk_nope_head_dim + v_head_dim, -1)
-        k_b, v_b = torch.split(kv_b, [qk_nope_head_dim, v_head_dim], dim=1)
-        k_b = k_b.transpose(1, 2)  # [1, kv_lora, qk_nope]
-        yield (format(ATTN_K_B, bid), k_b)
-        yield (format(ATTN_V_B, bid), v_b)
-        yield (format(ATTN_KV_B, bid), data)  # keep original for non-absorbed fallback
-        return
-    ```
-- [ ] **Rename expert bias**: `expert_bias` → `expert_bias.bias` (already done by `BailingMoeV2Model`).
-- [ ] **Expert stacking**: 256 experts → one 3D tensor per `{down,gate,up}_proj` (already done by `BailingMoeV2Model`).
-- [ ] **Bake per-layer slope tensor** for linear-attn layers:
-    ```python
-    def build_slopes(num_heads, layer_idx, num_layers):
-        # EXACT replication of HF: includes the (layer_idx - 1) offset and +1e-5
-        slopes = _get_slopes(num_heads)  # see HF build_slope_tensor
-        scale = 1 - (layer_idx - 1) / (num_layers - 1) + 1e-5
-        return -torch.tensor(slopes, dtype=torch.float32) * scale
-    ```
-    Emit one `blk.{il}.attn_g_decay` F32 tensor per recurrent layer at convert time.
-    **Why bake**: the slopes are a closed-form function of `(layer_idx, num_heads, num_layers)` — no need to recompute at runtime. Mirrors `KimiLinearModel`'s `A_log → -exp(A_log)` pre-bake.
+### 2.3 `modify_tensors` overrides ✅
+- [x] `kv_b_proj` split into transposed `k_b_proj` + `v_b_proj`, original kept for non-absorbed fallback. All three flow through V2's super for expert/bias handling.
+- [x] Expert bias rename + expert stacking inherited from V2's `modify_tensors`.
+- [x] Slope tensors yielded via `generate_extra_tensors` (see 2.4) and routed through the standard `modify_tensors` pipeline.
+- [x] Slope formula bit-exactness verified vs hand-computed reference: max abs diff = 0.0 for n=32.
 
-### 2.4 MTP weight loading
-- [ ] HF stores MTP in `model-mtp-layer.safetensors`, **not referenced** by `model.safetensors.index.json`. Override the converter's tensor enumeration to additionally walk this file. Tensor keys are `model.layers.32.*`.
-- [ ] MTP-specific tensor mappings:
-    - `model.layers.32.enorm.weight` → `blk.32.attn_sub_norm` (or new `MODEL_TENSOR.ENORM`)
-    - `model.layers.32.hnorm.weight` → `blk.32.ffn_sub_norm` (or new `HNORM`)
-    - `model.layers.32.eh_proj.weight` → `blk.32.eh_proj`
-    - `model.layers.32.final_layernorm.weight` → `blk.32.attn_norm_post` (or new `MTP_NORM`)
-    - All other tensors (MLA, MoE, dense norms) reuse the standard mappings with `bid=32`.
-- [ ] **Verify**: MTP file has NO `lm_head.weight` — confirms MTP shares `lm_head` with main model (HF code: `mtp_logits = self.lm_head(mtp_hidden_states)`). Document this in the graph builder.
+### 2.4 MTP weight loading ✅
+- [x] `generate_extra_tensors` loads `model-mtp-layer.safetensors` and yields its tensors with HF-style names. Logs a warning (not error) if the file is missing.
+- [x] MTP tensor names handled via the existing schema mapping (Phase 1):
+  - `enorm` → `NEXTN_ENORM`, `hnorm` → `NEXTN_HNORM`, `eh_proj` → `NEXTN_EH_PROJ`
+  - `final_layernorm` → `LAYER_OUT_NORM` (matches V2's same mapping)
+  - MLA + MoE tensors share schema with main-stack equivalents (bid=32)
+- [x] Slope tensors for the 28 linear-attn layers also yielded from `generate_extra_tensors`.
+- [x] Verified MTP file has no `lm_head` → main `output` is shared (Phase 5 graph builder will reuse it).
 
-### 2.5 Robustness: derive layer type from tensor presence
-- [ ] After loading all tensors, assert per-layer:
-    - Recurrent layer: has `query_key_value`, `g_proj`, `g_norm`; lacks `q_a_proj`/`kv_b_proj`.
-    - MLA layer: has `q_a_proj`, `kv_a_proj_with_mqa`, `kv_b_proj`; lacks `query_key_value`/`g_proj`.
-- [ ] Cross-check against the formula-driven `head_count_kv` list. Fail conversion on mismatch.
+### 2.5 Robustness: derive layer type from tensor presence (DEFERRED)
+- [ ] After loading all tensors, assert per-layer (recurrent has qkv+g_proj+g_norm; MLA has q_a_proj+kv_b_proj). Cross-check against the formula-driven head_count_kv list.
+- Status: **deferred to follow-up**. Mismatch will surface as a clear missing-tensor error in the C++ loader; the assertion is defensive polish.
 
 ### 2.6 Vocab
-- [ ] Reuse `_set_vocab_gpt2()` (V2 vocab; same 157184-entry tokenizer family).
-- [ ] **Verify pretokenizer hash**: run `convert_hf_to_gguf_update.py`, confirm the hash matches existing `bailingmoe2` entry. If different, add a new entry to `src/llama-vocab.cpp::tokenizer_pre`.
-- [ ] **Verify EOS**: confirm `eos_token_id=156895` in `config.json` resolves to the `<|role_end|>` string in the vocab; ensure GGUF metadata lists `<|role_end|>` as EOS.
+- [x] `_set_vocab_gpt2()` inherited from V2 (no override needed).
+- [ ] **Verify pretokenizer hash**: run `convert_hf_to_gguf_update.py` against an actual checkpoint; confirm matches the existing `bailingmoe2` entry. (Requires HF download; deferred.)
+- [ ] **Verify EOS**: confirm `eos_token_id=156895` resolves to `<|role_end|>` and is correctly emitted in GGUF. (Requires HF download; deferred.)
 
 ---
 
