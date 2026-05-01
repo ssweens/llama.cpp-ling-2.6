@@ -63,17 +63,19 @@ llm_build_bailingmoe2_5::llm_build_bailingmoe2_5(const llama_model & model, cons
             qkv = ggml_cast(ctx0, qkv, GGML_TYPE_F32);
             cb(qkv, "qkv_f32", il);
 
+            // HF/SGLang split qkv from rows laid out as [Q | K | V]; keep token stride at 3*d_inner.
+            const size_t qkv_token_stride = ggml_row_size(qkv->type, 3 * d_inner);
             ggml_tensor * Qcur = ggml_view_3d(ctx0, qkv, head_dim, n_head, n_tokens,
                     ggml_row_size(qkv->type, head_dim),
-                    ggml_row_size(qkv->type, head_dim * n_head),
+                    qkv_token_stride,
                     0);
             ggml_tensor * Kcur = ggml_view_3d(ctx0, qkv, head_dim, n_head, n_tokens,
                     ggml_row_size(qkv->type, head_dim),
-                    ggml_row_size(qkv->type, head_dim * n_head),
+                    qkv_token_stride,
                     ggml_row_size(qkv->type, d_inner));
             ggml_tensor * Vcur = ggml_view_3d(ctx0, qkv, head_dim, n_head, n_tokens,
                     ggml_row_size(qkv->type, head_dim),
-                    ggml_row_size(qkv->type, head_dim * n_head),
+                    qkv_token_stride,
                     ggml_row_size(qkv->type, 2 * d_inner));
 
             Qcur = build_norm(Qcur, layer.attn_q_norm, NULL, LLM_NORM_RMS, il);
@@ -94,9 +96,9 @@ llm_build_bailingmoe2_5::llm_build_bailingmoe2_5(const llama_model & model, cons
             Qcur = ggml_scale(ctx0, Qcur, q_scale_gla);
             cb(Qcur, "Qcur_scaled", il);
 
-            Qcur = ggml_reshape_4d(ctx0, Qcur, head_dim, n_head, n_seq_tokens, n_seqs);
-            Kcur = ggml_reshape_4d(ctx0, Kcur, head_dim, n_head, n_seq_tokens, n_seqs);
-            Vcur = ggml_reshape_4d(ctx0, Vcur, head_dim, n_head, n_seq_tokens, n_seqs);
+            Qcur = ggml_cont_4d(ctx0, Qcur, head_dim, n_head, n_seq_tokens, n_seqs);
+            Kcur = ggml_cont_4d(ctx0, Kcur, head_dim, n_head, n_seq_tokens, n_seqs);
+            Vcur = ggml_cont_4d(ctx0, Vcur, head_dim, n_head, n_seq_tokens, n_seqs);
 
             const auto * mctx_cur = inp_rs->mctx;
             const auto kv_head = mctx_cur->get_head();

@@ -254,6 +254,82 @@ def check_router(store: TensorStore, seed: int, tokens: int) -> None:
     print_stats("router weights", wt_hf, wt_gg)
 
 
+def moe7_block(store: TensorStore, prefix: str, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    cfg = store.config
+    getter = store.hf if prefix == "hf" else store.gguf
+    if prefix == "hf":
+        w_gate = getter("model.layers.7.mlp.gate.weight")
+        b_gate = getter("model.layers.7.mlp.gate.expert_bias")
+    else:
+        w_gate = getter("blk.7.ffn_gate_inp.weight")
+        b_gate = getter("blk.7.exp_probs_b.bias")
+
+    scores = torch.sigmoid(x @ w_gate.T)
+    biased = scores + b_gate
+    n_group = cfg.get("n_group", 8)
+    topk_group = cfg.get("topk_group", 4)
+    top_k = cfg["num_experts_per_tok"]
+    group_scores = biased.view(x.shape[0], n_group, -1).topk(2, dim=-1).values.sum(dim=-1)
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False).indices
+    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+    group_mask.scatter_(1, group_idx, True)
+    score_mask = group_mask.unsqueeze(-1).expand(x.shape[0], n_group, cfg["num_experts"] // n_group).reshape(x.shape[0], -1)
+    masked = biased.masked_fill(~score_mask, float("-inf"))
+    _, idx = torch.topk(masked, k=top_k, dim=-1)
+    weights = torch.gather(scores, dim=1, index=idx)
+    weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    weights = weights * cfg["routed_scaling_factor"]
+
+    out = torch.zeros_like(x)
+    if prefix == "gguf":
+        gate_exps = getter("blk.7.ffn_gate_exps.weight")
+        up_exps = getter("blk.7.ffn_up_exps.weight")
+        down_exps = getter("blk.7.ffn_down_exps.weight")
+
+    for t in range(x.shape[0]):
+        for j in range(top_k):
+            e = int(idx[t, j].item())
+            if prefix == "hf":
+                gate_w = getter(f"model.layers.7.mlp.experts.{e}.gate_proj.weight")
+                up_w = getter(f"model.layers.7.mlp.experts.{e}.up_proj.weight")
+                down_w = getter(f"model.layers.7.mlp.experts.{e}.down_proj.weight")
+            else:
+                gate_w = gate_exps[e]
+                up_w = up_exps[e]
+                down_w = down_exps[e]
+            expert = (torch.nn.functional.silu(x[t] @ gate_w.T) * (x[t] @ up_w.T)) @ down_w.T
+            out[t] += weights[t, j] * expert
+
+    if prefix == "hf":
+        shexp_gate = getter("model.layers.7.mlp.shared_experts.gate_proj.weight")
+        shexp_up = getter("model.layers.7.mlp.shared_experts.up_proj.weight")
+        shexp_down = getter("model.layers.7.mlp.shared_experts.down_proj.weight")
+    else:
+        shexp_gate = getter("blk.7.ffn_gate_shexp.weight")
+        shexp_up = getter("blk.7.ffn_up_shexp.weight")
+        shexp_down = getter("blk.7.ffn_down_shexp.weight")
+    shared = (torch.nn.functional.silu(x @ shexp_gate.T) * (x @ shexp_up.T)) @ shexp_down.T
+    out = out + shared
+    return {"idx": idx, "weights": weights, "shared": shared, "out": out}
+
+
+def check_moe7(store: TensorStore, seed: int, tokens: int) -> None:
+    cfg = store.config
+    torch.manual_seed(seed + 2)
+    x = torch.randn(tokens, cfg["hidden_size"], dtype=torch.float32) * 0.02
+    hf = moe7_block(store, "hf", x)
+    gg = moe7_block(store, "gguf", x)
+    print("\n== layer-7 sparse MoE selected-expert block (HF-dequant vs GGUF Q8_0) ==")
+    print(f"topk exact match: {bool(torch.equal(hf['idx'], gg['idx']))}")
+    print(f"HF topk[0]:   {hf['idx'][0].tolist()}")
+    print(f"GGUF topk[0]: {gg['idx'][0].tolist()}")
+    for key in ["weights", "shared", "out"]:
+        print_stats(f"moe_{key}", hf[key], gg[key])
+        for label, val in [("hf", hf[key]), ("gguf", gg[key])]:
+            if not torch.isfinite(val).all():
+                raise RuntimeError(f"non-finite values in {label}.moe_{key}")
+
+
 def linear_attention_block(store: TensorStore, prefix: str, x: torch.Tensor) -> dict[str, torch.Tensor]:
     cfg = store.config
     H = cfg["num_attention_heads"]
@@ -305,6 +381,32 @@ def linear_attention_block(store: TensorStore, prefix: str, x: torch.Tensor) -> 
     return {"x_norm": x_norm, "qkv": qkv, "scan": o, "out": out}
 
 
+def dense_ffn(store: TensorStore, prefix: str, layer: int, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    cfg = store.config
+    eps = cfg["rms_norm_eps"]
+    getter = store.hf if prefix == "hf" else store.gguf
+    if prefix == "hf":
+        names = {
+            "ffn_norm": f"model.layers.{layer}.post_attention_layernorm.weight",
+            "gate": f"model.layers.{layer}.mlp.gate_proj.weight",
+            "up": f"model.layers.{layer}.mlp.up_proj.weight",
+            "down": f"model.layers.{layer}.mlp.down_proj.weight",
+        }
+    else:
+        names = {
+            "ffn_norm": f"blk.{layer}.ffn_norm.weight",
+            "gate": f"blk.{layer}.ffn_gate.weight",
+            "up": f"blk.{layer}.ffn_up.weight",
+            "down": f"blk.{layer}.ffn_down.weight",
+        }
+
+    x_norm = rms_norm(x, getter(names["ffn_norm"]), eps)
+    gate = x_norm @ getter(names["gate"]).T
+    up = x_norm @ getter(names["up"]).T
+    out = (torch.nn.functional.silu(gate) * up) @ getter(names["down"]).T
+    return {"x_norm": x_norm, "gate": gate, "up": up, "out": out}
+
+
 def check_linear0(store: TensorStore, seed: int, tokens: int) -> None:
     cfg = store.config
     torch.manual_seed(seed)
@@ -318,6 +420,22 @@ def check_linear0(store: TensorStore, seed: int, tokens: int) -> None:
             if not torch.isfinite(val).all():
                 raise RuntimeError(f"non-finite values in {label}.{key}")
     print(f"out norms: hf={hf['out'].norm().item():.6g}, gguf={gg['out'].norm().item():.6g}")
+
+    hf_resid = x + hf["out"]
+    gg_resid = x + gg["out"]
+    hf_ffn = dense_ffn(store, "hf", 0, hf_resid)
+    gg_ffn = dense_ffn(store, "gguf", 0, gg_resid)
+    hf_out = hf_resid + hf_ffn["out"]
+    gg_out = gg_resid + gg_ffn["out"]
+    print("\n== layer-0 full block incl residual + dense FFN (HF-dequant vs GGUF Q8_0) ==")
+    print_stats("attn_residual", hf_resid, gg_resid)
+    for key in ["x_norm", "gate", "up", "out"]:
+        print_stats(f"ffn_{key}", hf_ffn[key], gg_ffn[key])
+        for label, val in [("hf", hf_ffn[key]), ("gguf", gg_ffn[key])]:
+            if not torch.isfinite(val).all():
+                raise RuntimeError(f"non-finite values in {label}.ffn_{key}")
+    print_stats("layer0_out", hf_out, gg_out)
+    print(f"layer0 out norms: hf={hf_out.norm().item():.6g}, gguf={gg_out.norm().item():.6g}")
 
 
 def mla_attention_block(store: TensorStore, prefix: str, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -381,6 +499,50 @@ def mla_attention_block(store: TensorStore, prefix: str, x: torch.Tensor) -> dic
     return {"x_norm": x_norm, "q": q_full, "k": k_full, "attn": attn, "out": out}
 
 
+def mla_attention_block_absorbed_gguf(store: TensorStore, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    cfg = store.config
+    H = cfg["num_attention_heads"]
+    qk_nope = cfg["qk_nope_head_dim"]
+    qk_rope = cfg["qk_rope_head_dim"]
+    qk_dim = qk_nope + qk_rope
+    v_dim = cfg["v_head_dim"]
+    kv_rank = cfg["kv_lora_rank"]
+    eps = cfg["rms_norm_eps"]
+    base = cfg["rope_theta"]
+    getter = store.gguf
+
+    x_norm = rms_norm(x, getter("blk.7.attn_norm.weight"), eps)
+    q_lat = rms_norm(x_norm @ getter("blk.7.attn_q_a.weight").T, getter("blk.7.attn_q_a_norm.weight"), eps)
+    q = (q_lat @ getter("blk.7.attn_q_b.weight").T).view(x.shape[0], H, qk_dim)
+    q_nope, q_rot = q.split([qk_nope, qk_rope], dim=-1)
+
+    kv = x_norm @ getter("blk.7.attn_kv_a_mqa.weight").T
+    kv_lat, k_rot = kv.split([kv_rank, qk_rope], dim=-1)
+    kv_lat_norm = rms_norm(kv_lat, getter("blk.7.attn_kv_a_norm.weight"), eps)
+
+    pos = torch.arange(x.shape[0], dtype=torch.float32)
+    q_rot = rope_interleave_mla(q_rot, pos, qk_rope, base)
+    k_rot = rope_interleave_mla(k_rot[:, None, :], pos, qk_rope, base).expand(-1, H, -1)
+
+    # GGUF split tensors are stored in Python-visible shape [H, kv_rank, qk_nope]
+    # and [H, v_dim, kv_rank], matching the absorbed MLA algebra.
+    k_b = getter("blk.7.attn_k_b.weight")
+    v_b = getter("blk.7.attn_v_b.weight")
+    q_nope_absorbed = torch.einsum("thd,hkd->thk", q_nope, k_b)
+
+    scores_nope = torch.einsum("thk,sk->hts", q_nope_absorbed, kv_lat_norm)
+    scores_rope = torch.einsum("thd,shd->hts", q_rot, k_rot)
+    scores = (scores_nope + scores_rope) * (qk_dim ** -0.5)
+    causal = torch.triu(torch.ones(x.shape[0], x.shape[0], dtype=torch.bool), diagonal=1)
+    scores = scores.masked_fill(causal[None, :, :], float("-inf"))
+    probs = torch.softmax(scores, dim=-1)
+
+    attn_lat = torch.einsum("hts,sk->thk", probs, kv_lat_norm)
+    attn = torch.einsum("thk,hvk->thv", attn_lat, v_b).reshape(x.shape[0], H * v_dim)
+    out = attn @ getter("blk.7.attn_output.weight").T
+    return {"q_nope_absorbed": q_nope_absorbed, "attn_lat": attn_lat, "attn": attn, "out": out}
+
+
 def check_mla7(store: TensorStore, seed: int, tokens: int) -> None:
     cfg = store.config
     torch.manual_seed(seed + 1)
@@ -394,6 +556,14 @@ def check_mla7(store: TensorStore, seed: int, tokens: int) -> None:
             if not torch.isfinite(val).all():
                 raise RuntimeError(f"non-finite values in {label}.{key}")
     print(f"out norms: hf={hf['out'].norm().item():.6g}, gguf={gg['out'].norm().item():.6g}")
+
+    absorbed = mla_attention_block_absorbed_gguf(store, x)
+    print("\n== layer-7 MLA GGUF absorbed split-kv vs GGUF decompressed reference ==")
+    for key in ["attn", "out"]:
+        print_stats(f"absorbed_{key}", absorbed[key], gg[key])
+        if not torch.isfinite(absorbed[key]).all():
+            raise RuntimeError(f"non-finite values in absorbed.{key}")
+    print(f"absorbed out norm: {absorbed['out'].norm().item():.6g}")
 
 
 def main() -> int:
@@ -410,6 +580,7 @@ def main() -> int:
     check_tensor_conversion(store)
     check_slopes(store)
     check_router(store, args.seed, args.tokens)
+    check_moe7(store, args.seed, args.tokens)
     check_linear0(store, args.seed, args.tokens)
     check_mla7(store, args.seed, args.tokens)
     print("\nOK: CPU-only Ling-2.6 layer probe completed")
