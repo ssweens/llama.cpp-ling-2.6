@@ -97,32 +97,31 @@ Companion document: `tasks/review-findings.md` (open decisions, prior-plan corre
 
 ---
 
-## Phase 3: C++ architecture & hparams
+## Phase 3: C++ architecture & hparams ✅ (except graph dispatch, deferred to Phase 5)
 
-### 3.1 `src/llama-arch.{h,cpp}`
-- [ ] Add `LLM_ARCH_BAILINGMOE2_5` enum value.
-- [ ] Add `{ LLM_ARCH_BAILINGMOE2_5, "bailingmoe2.5" }` to the name table.
-- [ ] Register all per-layer tensors in the schema map (mirrors V2's entry plus MLA + linear-attn-extras).
-- [ ] Add `LLM_ARCH_BAILINGMOE2_5` to the hybrid-arch list (alongside `LLM_ARCH_KIMI_LINEAR`, `LLM_ARCH_QWEN3NEXT`) in `llama-arch.cpp`'s recurrent-arch checks.
+### 3.1 `src/llama-arch.{h,cpp}` ✅
+- [x] Add `LLM_ARCH_BAILINGMOE2_5` enum value.
+- [x] Add `{ LLM_ARCH_BAILINGMOE2_5, "bailingmoe2.5" }` to the name table.
+- [x] Add 3 new tensor enums: `ATTN_G_PROJ`, `ATTN_G_NORM`, `ATTN_G_DECAY`.
+- [x] Add `LLM_ARCH_BAILINGMOE2_5` to `llm_arch_is_hybrid`.
+- [x] Add `LLM_ARCH_BAILINGMOE2_5` to `llm_arch_supports_sm_tensor` false list (matches KIMI_LINEAR precedent).
+- [x] Wire global tensor name strings + `LLM_TENSOR_INFOS` entries (MUL_MAT/MUL/SSM_SCAN buffer hints).
 
-### 3.2 `src/llama-hparams.{h,cpp}`
-- [ ] Reuse existing `recurrent_layer_arr` (already present for hybrid archs). Populate from the per-layer `head_count_kv` list during model load: `recurrent_layer_arr[il] = (head_count_kv[il] == 0)`.
-- [ ] No new hparams fields needed; reuse `n_embd_head_k_mla`, `n_embd_head_v_mla`, `n_lora_q`, `n_lora_kv`, `n_rot`.
+### 3.2 `src/llama-hparams.{h,cpp}` ✅
+- [x] Reuse existing `recurrent_layer_arr` (set by load_hparams from per-layer `head_count_kv == 0`).
+- [x] No new hparams fields needed; reuse `n_embd_head_k_mla_impl`, `n_embd_head_v_mla_impl`, `n_lora_q`, `n_lora_kv`, `n_rot`, `n_norm_groups`, `nextn_predict_layers`.
+- [x] Add `attn_g_proj`, `attn_g_norm`, `attn_g_decay` tensor pointers to `struct llama_layer`.
 
-### 3.3 `src/llama-model.cpp`
-- [ ] Add `case LLM_ARCH_BAILINGMOE2_5` in `load_hparams` — mirror the BAILINGMOE2 case plus MLA hparams loading from `KIMI_LINEAR`.
-- [ ] Add `case LLM_ARCH_BAILINGMOE2_5` in `load_tensors` — per layer, gate on `is_recurrent(il)`:
-    - Recurrent: load `attn_qkv`, `attn_q_norm`, `attn_k_norm`, `attn_out`, `attn_g_proj`, `attn_g_norm`, `attn_g_decay`.
-    - MLA: load `attn_q_a`, `attn_q_a_norm`, `attn_q_b`, `attn_kv_a_mqa`, `attn_kv_a_norm`, `attn_kv_b`, `attn_k_b`, `attn_v_b`, `attn_out`.
-    - All layers: `attn_norm`, `ffn_norm`.
-    - First `n_layer_dense_lead` layers: dense `ffn_{gate,up,down}`. Others: MoE block (`ffn_gate_inp`, `ffn_exp_probs_b`, expert tensors, shared expert tensors).
-    - MTP layer (il=32): MLA tensors + MoE block + four MTP norms (`enorm`, `hnorm`, `eh_proj`, `final_layernorm`).
-- [ ] Set `model.output = model.lm_head` (no MTP-specific output head).
-- [ ] Set hybrid memory params:
-    - `n_embd_r() = 0` (no conv state, unlike Kimi).
-    - `n_embd_s() = qk_head_dim * v_head_dim * n_head = 192 * 128 * 32` — wait, **state dimensions are `head_dim_k × head_dim_v × n_head`** for the recurrence. Linear-attn uses full Q/K head dim (128, after RoPE applied to first 64), so `n_embd_s() = 128 * 128 * 32 = 524288` F32 elements per sequence.
-- [ ] Add `case LLM_ARCH_BAILINGMOE2_5` to the model-build dispatch: `llm = std::make_unique<llm_build_bailingmoe2_5>(*this, params)`.
-- [ ] Add to graph type / output type case lists (model-print, output-name, etc. — follow `LLM_ARCH_KIMI_LINEAR` precedent).
+### 3.3 `src/llama-model.cpp` ✅ (loader; graph dispatch stubbed)
+- [x] `load_hparams` case for `LLM_ARCH_BAILINGMOE2_5`: reads V2 MoE KVs + MLA dims (key_length_mla, value_length_mla, q_lora_rank, kv_lora_rank) + group_norm_groups. Populates `recurrent_layer_arr`. Type detection by n_layer (32 or 33 → LLM_TYPE_100B_A6B for Ling-2.6-flash).
+- [x] `load_tensors` case dispatches per-layer on `is_mtp` and `is_recurrent`:
+    - Linear-attn: attn_qkv, attn_out, attn_q_norm, attn_k_norm, attn_g_proj, attn_g_norm, attn_g_decay.
+    - MLA (and MTP): wq_a, attn_q_a_norm, wq_b, wkv_a_mqa, attn_kv_a_norm, wkv_b/wk_b/wv_b (with absorbed-fallback), wo.
+    - FFN: dense for first n_layer_dense_lead layers, MoE for the rest. MTP always MoE.
+    - MTP: enorm, hnorm, eh_proj, layer_out_norm. tok_embd and output (lm_head) shared with main.
+- [x] Add `LLM_ARCH_BAILINGMOE2_5` to NEOX rope_type list.
+- [x] **Graph dispatch case**: stubbed with a `runtime_error` describing Phase 5 status. Loader works; inference will throw a clear message until Phase 5 lands.
+- [x] Build verified clean (`cmake --build build --target llama -j 4`).
 
 ### 3.4 Chat template (`src/llama-chat.cpp`)
 - [ ] **Diff** V2.5's `chat_template.jinja` against the existing `LLM_CHAT_TEMPLATE_BAILING2`:

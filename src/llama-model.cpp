@@ -2522,6 +2522,48 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
+        case LLM_ARCH_BAILINGMOE2_5:
+            {
+                // Inherits MoE shape from BAILINGMOE2; adds DeepSeek-V3 MLA dims
+                // for the every-G-th attention layer, and a Lightning-Attention-2
+                // recurrent state for the in-between layers.
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,         hparams.n_layer_dense_lead, false);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+                ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+                ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,               hparams.expert_weights_norm, false);
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                hparams.expert_gating_func);
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,              hparams.nextn_predict_layers, false);
+
+                // MLA dimensions (DeepSeek-V3 with q-LoRA)
+                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_MLA,    hparams.n_embd_head_k_mla_impl);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_MLA,  hparams.n_embd_head_v_mla_impl);
+                ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
+                ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
+
+                // Linear-attn output GroupRMSNorm group count (4 for Ling-2.6-flash)
+                ml.get_key(LLM_KV_ATTENTION_GROUPNORM_GROUPS,  hparams.n_norm_groups);
+
+                GGML_ASSERT(hparams.nextn_predict_layers < hparams.n_layer && "nextn_predict_layers must be < n_layer");
+                hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
+
+                // Mark linear-attn layers as recurrent. The per-layer
+                // head_count_kv list (loaded earlier by the base loader) encodes
+                // 0 for recurrent, n_head for MLA.
+                for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                    hparams.recurrent_layer_arr[i] = (hparams.n_head_kv(i) == 0);
+                }
+
+                switch (hparams.n_layer) {
+                    // Ling-2.6-flash: 32 transformer + 1 MTP = 33 total
+                    // Total params: 104B; active: 7.4B
+                    case 32: type = LLM_TYPE_100B_A6B; break;
+                    case 33: type = LLM_TYPE_100B_A6B; break;
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
         case LLM_ARCH_DOTS1:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -6665,6 +6707,111 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         }
                     }
                 } break;
+            case LLM_ARCH_BAILINGMOE2_5:
+                {
+                    const int64_t n_ff_exp        = hparams.n_ff_exp;
+                    const int64_t n_expert_shared = hparams.n_expert_shared;
+
+                    // MLA dimensions (DeepSeek-V3 with q-LoRA)
+                    const int64_t q_lora_rank      = hparams.n_lora_q;
+                    const int64_t kv_lora_rank     = hparams.n_lora_kv;
+                    const int64_t n_embd_head_k_mla = hparams.n_embd_head_k_mla();
+                    const int64_t n_embd_head_v_mla = hparams.n_embd_head_v_mla();
+                    const int64_t qk_rope_head_dim  = hparams.n_rot();  // partial rotary on first n_rot dims
+                    const int64_t qk_nope_head_dim  = n_embd_head_k_mla - qk_rope_head_dim;
+
+                    // Linear-attn dimensions (per-layer head_dim, n_kv == n_head)
+                    const int64_t la_head_dim      = hparams.n_embd_head_k();  // 128 for Ling-2.6-flash (per-layer; same across all layers here)
+
+                    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,  "weight"), {n_embd, n_vocab}, 0);
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
+
+                    GGML_ASSERT(n_expert > 0      && "n_expert must be > 0 for bailingmoe2.5");
+                    GGML_ASSERT(n_expert_used > 0 && "n_expert_used must be > 0 for bailingmoe2.5");
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+
+                        const bool is_mtp = hparams.nextn_predict_layers > 0
+                                         && (uint32_t) i >= n_layer - hparams.nextn_predict_layers;
+                        // Linear-attn layers have head_count_kv[il] == 0 (set by converter).
+                        // MTP layer always uses MLA (HF / SGLang convention).
+                        const bool is_linear_attn = !is_mtp && hparams.is_recurrent(i);
+
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, 0);
+
+                        if (is_linear_attn) {
+                            // ===== Linear attention (Lightning-Attention-2 / simple_gla) =====
+                            // Fused QKV: hidden -> (n_head + 2*n_kv) * head_dim. For Ling-2.6-flash
+                            // n_kv == n_head, so total output is 4 * n_head * head_dim. We compute
+                            // it via n_embd + 2*n_embd_gqa to follow the BAILINGMOE2 pattern.
+                            layer.wqkv         = create_tensor(tn(LLM_TENSOR_ATTN_QKV,    "weight", i), {n_embd, n_embd + 2*n_embd_gqa}, 0);
+                            layer.wo           = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", i), {la_head_dim * n_head, n_embd}, 0);
+                            layer.attn_q_norm  = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {la_head_dim}, 0);
+                            layer.attn_k_norm  = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {la_head_dim}, 0);
+
+                            // Output sigmoid gate projection (consumes the layer-input attn_norm output)
+                            layer.attn_g_proj  = create_tensor(tn(LLM_TENSOR_ATTN_G_PROJ, "weight", i), {n_embd, la_head_dim * n_head}, 0);
+                            // GroupRMSNorm scale (per-channel)
+                            layer.attn_g_norm  = create_tensor(tn(LLM_TENSOR_ATTN_G_NORM, "weight", i), {la_head_dim * n_head}, 0);
+                            // Per-head fixed log-decay (already negated at convert time, F32)
+                            layer.attn_g_decay = create_tensor(tn(LLM_TENSOR_ATTN_G_DECAY,"weight", i), {n_head}, 0);
+                        } else {
+                            // ===== MLA layer (DeepSeek-V3 with q-LoRA) =====
+                            // Identical shape to deepseek2.cpp / kimi-linear MLA branch.
+                            layer.wq_a          = create_tensor(tn(LLM_TENSOR_ATTN_Q_A,        "weight", i), {n_embd, q_lora_rank}, 0);
+                            layer.attn_q_a_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_A_NORM,   "weight", i), {q_lora_rank}, 0);
+                            layer.wq_b          = create_tensor(tn(LLM_TENSOR_ATTN_Q_B,        "weight", i), {q_lora_rank, n_head * n_embd_head_k_mla}, 0);
+                            layer.wkv_a_mqa     = create_tensor(tn(LLM_TENSOR_ATTN_KV_A_MQA,   "weight", i), {n_embd, kv_lora_rank + qk_rope_head_dim}, 0);
+                            layer.attn_kv_a_norm= create_tensor(tn(LLM_TENSOR_ATTN_KV_A_NORM,  "weight", i), {kv_lora_rank}, 0);
+
+                            // Try non-absorbed (legacy) first; if absent the loader will fall through
+                            // to the absorbed (k_b/v_b) form. Matches kimi-linear's pattern.
+                            layer.wkv_b = create_tensor(tn(LLM_TENSOR_ATTN_KV_B, "weight", i),
+                                {kv_lora_rank, n_head * (qk_nope_head_dim + n_embd_head_v_mla)},
+                                TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+                            if (!layer.wkv_b) {
+                                layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K_B, "weight", i), {qk_nope_head_dim, kv_lora_rank, n_head}, 0);
+                                layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V_B, "weight", i), {kv_lora_rank, n_embd_head_v_mla, n_head}, 0);
+                            }
+                            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head * n_embd_head_v_mla, n_embd}, 0);
+                        }
+
+                        // FFN block: dense for first first_k_dense_replace layers, MoE otherwise.
+                        // MTP always uses MoE (HF BailingMoeV2_5MTPLayer hardcodes a SparseMoeBlock).
+                        const bool use_dense_ffn = !is_mtp && (uint32_t) i < hparams.n_layer_dense_lead;
+                        if (use_dense_ffn) {
+                            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+                            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
+                            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+                        } else {
+                            const int64_t n_ff_shexp = (hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff_exp) * n_expert_shared;
+
+                            layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
+                            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, TENSOR_NOT_REQUIRED);
+
+                            layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp,   n_embd, n_expert}, 0);
+                            layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {  n_embd, n_ff_exp, n_expert}, 0);
+
+                            layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd, n_ff_shexp}, 0);
+                            layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_shexp, n_embd}, 0);
+                            layer.ffn_up_shexp   = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,   "weight", i), {n_embd, n_ff_shexp}, 0);
+                        }
+
+                        // MTP-specific tensors. tok_embd and output (lm_head) are shared with the
+                        // main model (verified against the actual HF tensor index: the MTP
+                        // safetensors file contains no embed_tokens or lm_head).
+                        if (is_mtp) {
+                            layer.nextn.eh_proj  = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), {2 * n_embd, n_embd}, 0);
+                            layer.nextn.enorm    = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,  "weight", i), {n_embd}, 0);
+                            layer.nextn.hnorm    = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,  "weight", i), {n_embd}, 0);
+                            layer.layer_out_norm = create_tensor(tn(LLM_TENSOR_LAYER_OUT_NORM,"weight", i), {n_embd}, 0);
+                        }
+                    }
+                } break;
             case LLM_ARCH_DOTS1:
                 {
                     const int64_t n_ff_exp        = hparams.n_ff_exp;
@@ -8953,6 +9100,17 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
             {
                 llm = std::make_unique<llm_build_bailingmoe2>(*this, params);
             } break;
+        case LLM_ARCH_BAILINGMOE2_5:
+            {
+                // TODO(Phase 5): graph builder pending implementation alongside
+                // the new ggml_simple_gla_scan operator (Phase 4). Loading a
+                // bailingmoe2.5 model will succeed (tensors map correctly) but
+                // inference is not yet wired.
+                throw std::runtime_error(
+                    "bailingmoe2.5 (Ling-2.6-flash family) graph builder is not yet "
+                    "implemented in this build. Loading succeeded but inference is "
+                    "not available; track Phase 4-5 in tasks/todo.md.");
+            } break;
         case LLM_ARCH_SEED_OSS:
             {
                 llm = std::make_unique<llm_build_seed_oss>(*this, params);
@@ -9301,6 +9459,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_EXAONE_MOE:
         case LLM_ARCH_MINICPM3:
         case LLM_ARCH_BAILINGMOE2:
+        case LLM_ARCH_BAILINGMOE2_5:
         case LLM_ARCH_DOTS1:
         case LLM_ARCH_HUNYUAN_MOE:
         case LLM_ARCH_JAIS2:

@@ -258,6 +258,11 @@ struct llama_layer {
     struct ggml_tensor * wo_enc    = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
 
+    // bailingmoe2.5 linear-attn
+    struct ggml_tensor * attn_g_proj  = nullptr;
+    struct ggml_tensor * attn_g_norm  = nullptr;
+    struct ggml_tensor * attn_g_decay = nullptr;
+
     // relative position bias
     struct ggml_tensor * attn_rel_b       = nullptr;
     struct ggml_tensor * attn_rel_b_enc   = nullptr;
