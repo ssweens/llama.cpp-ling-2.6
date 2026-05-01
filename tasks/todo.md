@@ -293,10 +293,12 @@ mtp_logits = ggml_mul_mat(model.output, x);  // SHARED lm_head
     - Top-1 token argmax must match in 100% of compared positions.
 - [ ] CPU-only status (2026-04-30): full HF-vs-llama parity is not practical on this host without a smaller layer-isolated harness; the available checkpoint + Q8 GGUF already consume ~200GB on disk and full-model HF F32/BF16 CPU load would exceed the intended validation budget.
 - [ ] CPU runtime sanity found the graph executes without crashes, but greedy 64-token output from the Q8_0 GGUF is degenerate (`0000...`). Treat this as a parity/quality blocker until layer-isolated comparisons identify whether the issue is linear-attn math, MLA RoPE/absorbed KV, MoE routing, or FP8->Q8 conversion quality.
+- [x] Add CPU-only layer/component probe harness: `tasks/ling26_layer_probe.py`. It loads only selected safetensors/GGUF tensors and checks HF→GGUF tensor conversion, slope metadata, layer-7 MoE routing, layer-0 linear-attn attention-block math, and layer-7 MLA decompressed causal-reference math on short synthetic hidden states.
+- [x] Initial probe result (`python3 tasks/ling26_layer_probe.py --tokens 4 --threads 4`): selected tensor conversion, slope metadata, MoE router, layer-0 linear-attn attention block, and layer-7 MLA attention block all match closely between HF-dequantized weights and GGUF Q8_0 (cosine >= 0.99995 for probed block outputs). This makes converter tensor mapping, slope baking, group-limited router metadata, simple-GLA reference math, and MLA decompressed tensor flow unlikely causes of the degenerate full-model output.
 - [ ] If parity fails, bisect by:
     1. Embeddings only (truncate to 1 layer): verify token embedding identity.
-    2. One linear-attn layer end-to-end (force layer 0): isolates `simple_gla_scan` + GroupRMSNorm + RoPE-NeoX correctness.
-    3. One MLA layer end-to-end (force layer 7): isolates MLA RoPE convention + absorbed-KV path.
+    2. One linear-attn layer end-to-end (force layer 0): isolates `simple_gla_scan` + GroupRMSNorm + RoPE-NeoX correctness. Initial harness covers the attention sub-block but not the FFN/residual.
+    3. One MLA layer end-to-end (force layer 7): isolates MLA RoPE convention + absorbed-KV path. Initial harness covers decompressed causal MLA reference but not llama.cpp's absorbed KV-cache graph path directly.
     4. Full main stack: isolates layer-pattern bookkeeping.
     5. Add MTP: isolates MTP graph.
 
