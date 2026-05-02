@@ -51,6 +51,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
     const std::regex pattern_attn_out_bias   ("blk\\.\\d*\\.attn_output.bias");
     const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
+    const std::regex pattern_attn_g_proj_weight("blk\\.\\d*\\.attn_g_proj.weight");
+    const std::regex pattern_attn_g_norm_weight("blk\\.\\d*\\.attn_g_norm.weight");
 
     const std::regex pattern_ssm_dt          ("blk\\.\\d*\\.ssm_dt.bias");
     const std::regex pattern_ssm_a           ("blk\\.\\d*\\.ssm_a");
@@ -132,6 +134,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_qkv_weight)) {
+            if (ud->model->arch == LLM_ARCH_BAILINGMOE2_5) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if ( std::regex_match(tensor_name, pattern_qkv_bias)) {
@@ -141,9 +146,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
+            if (ud->model->arch == LLM_ARCH_BAILINGMOE2_5) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
+            if (ud->model->arch == LLM_ARCH_BAILINGMOE2_5) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
         if (std::regex_match(tensor_name, pattern_attn_out_bias)) {
@@ -153,6 +164,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_attn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
+        if (std::regex_match(tensor_name, pattern_attn_g_proj_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        if (std::regex_match(tensor_name, pattern_attn_g_norm_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
         if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
         }
@@ -161,6 +178,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_s_cache)) {
+            if (ud->model->arch == LLM_ARCH_BAILINGMOE2_5) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_conv1d)) {

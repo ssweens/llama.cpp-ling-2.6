@@ -344,6 +344,13 @@ mtp_logits = ggml_mul_mat(model.output, x);  // SHARED lm_head
 - [x] `llama-bench` after CUDA simple-GLA: `pp64 641.10 ± 15.19 t/s`, `tg128 34.24 ± 0.02 t/s` on 2x RTX 5090, Q2_K full offload. Log: `tasks/logs/ling26_simple_gla_cuda_vec_q2k_bench_p64n128.log`.
 - [x] Placement experiments: 3-GPU layer split was slower (~24.5 tok/s because the 3090 adds pipeline latency); 2-GPU row split was slower (~23.4 tok/s); tensor split is not implemented for `bailingmoe2.5`; `--no-host` and `-mg 1` did not improve decode.
 - [ ] Further speed work: single-stream decode remains MoE/matmul-launch bound at batch=1; likely follow-ups are MTP/NEXTN speculative decoding and/or deeper MoE kernel/fusion work, not more CPU fallback removal.
+- [x] Tensor-split enablement for `bailingmoe2.5` conservative smoke path:
+    - [x] Remove the architecture-level `-sm tensor` block for `LLM_ARCH_BAILINGMOE2_5`.
+    - [x] Keep BailingMoe2.5 attention/KV/recurrent state tensors mirrored for correctness; tensor split still applies to FFN/MoE/output paths. Attempts to split MLA KV-A before RMSNorm and recurrent state copies exposed invalid split-state/shape interactions, so deeper attention splitting remains follow-up work.
+    - [x] Add meta-backend support for fully mirrored Flash Attention inputs and for non-meta no-op view nodes inside meta graphs.
+    - [x] Build quality gate: `cmake --build build --target llama-completion -j 4` passed.
+    - [x] CUDA tensor-split smoke: `CUDA_VISIBLE_DEVICES=0,1 ./build/bin/llama-completion -m /home/bigkahuna/models/gguf/Ling-2.6-flash-fp8-Q2_K.gguf -ngl 99 -sm tensor -fa on -c 512 -n 1 -p 'hello' --temp 0 --top-k 1 -st --no-warmup` passed, output `Hello`. Log: `tasks/logs/ling26_tensor_split_cuda_n1_ctx512_simplified.log`.
+    - [x] CUDA tensor-split short quality smoke: same 2x5090 setup, `-n 24`, prompt `Write one short sentence about llamas.`, produced coherent output: `Llamas are gentle, social herd animals from the Andes known for their soft wool and curious expressions.` Log: `tasks/logs/ling26_tensor_split_cuda_short_sentence_ctx512.log`.
 
 ### 6.6 Documentation
 - [ ] Add Ling-2.6-flash to `README.md` supported-models table.
