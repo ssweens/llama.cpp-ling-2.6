@@ -46,8 +46,9 @@ llm_build_bailingmoe2_5::llm_build_bailingmoe2_5(const llama_model & model, cons
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    const int n_transformer_layers = n_layer - hparams.nextn_predict_layers;
-    for (int il = 0; il < n_transformer_layers; ++il) {
+    // Note: include all layers (including nextn prediction layers) so
+    // the imatrix collector sees their tensors during the forward pass.
+    for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
         ggml_tensor * inpSA = inpL;
 
@@ -208,7 +209,7 @@ llm_build_bailingmoe2_5::llm_build_bailingmoe2_5(const llama_model & model, cons
             cb(cur, "mla_out", il);
         }
 
-        if (il == n_transformer_layers - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
