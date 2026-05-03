@@ -2102,7 +2102,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 GGML_ASSERT(hparams.nextn_predict_layers < hparams.n_layer && "nextn_predict_layers must be < n_layer");
 
                 // TODO: when MTP is implemented, this should probably be updated if needed
-                hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
+                hparams.n_layer_kv_from_start = hparams.n_layer; // MTP layers also need KV cache
 
                 switch (hparams.n_layer) {
                     case 17: type = LLM_TYPE_1B; break; // GLM-OCR
@@ -2136,7 +2136,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 GGML_ASSERT(hparams.nextn_predict_layers < hparams.n_layer && "nextn_predict_layers must be < n_layer");
 
                 // TODO: when MTP is implemented, this should probably be updated if needed
-                hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
+                hparams.n_layer_kv_from_start = hparams.n_layer; // MTP layers also need KV cache
 
                 switch (hparams.n_layer) {
                     case 47: type = LLM_TYPE_106B_A12B; break; // GLM-4.5-Air (46 layers + 1 NextN layer)
@@ -2183,7 +2183,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 GGML_ASSERT(hparams.nextn_predict_layers < hparams.n_layer && "nextn_predict_layers must be < n_layer");
 
                 // TODO: when MTP is implemented, this should probably be updated if needed
-                hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
+                hparams.n_layer_kv_from_start = hparams.n_layer; // MTP layers also need KV cache
 
                 switch (hparams.n_layer) {
                     case 79: type = LLM_TYPE_744B_A40B; break;
@@ -2540,7 +2540,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 GGML_ASSERT(hparams.nextn_predict_layers < hparams.n_layer && "nextn_predict_layers must be < n_layer");
 
                 // TODO: when MTP is implemented, this should probably be updated if needed
-                hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
+                hparams.n_layer_kv_from_start = hparams.n_layer; // MTP layers also need KV cache
 
                 switch (hparams.n_layer) {
                     case 20: type = LLM_TYPE_16B_A1B; break;
@@ -2575,7 +2575,7 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 ml.get_key(LLM_KV_ATTENTION_GROUPNORM_GROUPS,  hparams.n_norm_groups);
 
                 GGML_ASSERT(hparams.nextn_predict_layers < hparams.n_layer && "nextn_predict_layers must be < n_layer");
-                hparams.n_layer_kv_from_start = hparams.n_layer - hparams.nextn_predict_layers;
+                hparams.n_layer_kv_from_start = hparams.n_layer; // MTP layers also need KV cache
 
                 // Mark linear-attn layers as recurrent. The per-layer
                 // head_count_kv list (loaded earlier by the base loader) encodes
