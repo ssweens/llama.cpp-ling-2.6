@@ -254,6 +254,18 @@ llm_build_bailingmoe2_5::llm_build_bailingmoe2_5(const llama_model & model, cons
 
         cur = ggml_add(ctx0, cur, ffn_inp);
         cur = build_cvec(cur, il);
+
+        // Ensure NextN/MTP projection weights are exercised in the forward graph so
+        // imatrix collection captures blk.*.nextn.eh_proj for low-bit I-quantization.
+        // eh_proj is Linear(2*hidden_size, hidden_size) — it takes concatenated
+        // [hidden_state, hidden_state] as input.
+        if (hparams.nextn_predict_layers > 0 && (uint32_t) il >= n_layer - hparams.nextn_predict_layers && layer.nextn.eh_proj) {
+            ggml_tensor * nextn_input = ggml_concat(ctx0, cur, inpSA, 0);
+            ggml_tensor * nextn_eh = ggml_mul_mat(ctx0, layer.nextn.eh_proj, nextn_input);
+            cb(nextn_eh, "nextn_eh_proj", il);
+            ggml_build_forward_expand(gf, nextn_eh);
+        }
+
         cb(cur, "l_out", il);
 
         inpL = cur;
